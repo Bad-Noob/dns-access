@@ -1,4 +1,4 @@
-.PHONY: check health syntax tests nginx unbound nftables services
+.PHONY: check health syntax tests nginx unbound nftables services version
 
 check:
 	python3 -m py_compile app.py maintenance.py
@@ -24,3 +24,6 @@ nftables:
 
 services:
 	../scripts/test-services.sh
+
+version:
+	../scripts/version.sh
