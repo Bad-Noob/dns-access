@@ -1,6 +1,6 @@
 [Unit]
 Description=DNS Access Maintenance
-After=network-online.target dns-access.service
+After=network-online.target dns-access.service nginx.service nftables.service
 Wants=network-online.target
 
 [Service]
@@ -8,3 +8,8 @@ Type=oneshot
 User=root
 Group=root
 ExecStart=/opt/dns-access/venv/bin/python /opt/dns-access/app/maintenance.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/dns-access/data /etc/nginx
