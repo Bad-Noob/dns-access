@@ -6,7 +6,4 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/certbot renew --quiet
-ExecStartPost=/usr/bin/systemctl reload nginx
-
-[Install]
-WantedBy=multi-user.target
+ExecStartPost=/bin/systemctl reload nginx
