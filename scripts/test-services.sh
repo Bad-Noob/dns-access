@@ -3,24 +3,27 @@
 set -euo pipefail
 
 SERVICES=(
-    "dns-access.service"
-    "dns-admin.service"
+    "nftables.service"
     "unbound.service"
     "AdGuardHome.service"
     "nginx.service"
-    "nftables.service"
+    "dns-access.service"
+    "dns-admin.service"
 )
 
 FAILED=0
 
-echo "[INFO] Checking service status..."
+echo "========================================"
+echo " DNS Access Service Check"
+echo "========================================"
 echo
 
 for service in "${SERVICES[@]}"; do
+
     if systemctl is-enabled --quiet "$service" 2>/dev/null; then
         ENABLED="enabled"
     else
-        ENABLED="not-enabled"
+        ENABLED="disabled"
     fi
 
     if systemctl is-active --quiet "$service" 2>/dev/null; then
@@ -30,7 +33,11 @@ for service in "${SERVICES[@]}"; do
         FAILED=$((FAILED + 1))
     fi
 
-    printf '%-28s %-10s %s\n' "$service" "$ACTIVE" "$ENABLED"
+    printf '%-28s %-10s %s\n' \
+        "$service" \
+        "$ACTIVE" \
+        "$ENABLED"
+
 done
 
 echo
