@@ -9,6 +9,7 @@ REQUIRED_FILES=(
     "VERSION"
     "README.md"
     "LICENSE"
+    ".gitignore"
 
     "dns-access/app.py"
     "dns-access/maintenance.py"
@@ -31,6 +32,7 @@ REQUIRED_FILES=(
     "scripts/test-services.sh"
     "scripts/run-tests.sh"
     "scripts/version.sh"
+    "scripts/check-project.sh"
 
     "config/AdGuardHome.service"
     "config/AdGuardHome.yaml"
