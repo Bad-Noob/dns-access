@@ -1,0 +1,16 @@
+[Unit]
+Description=AdGuard Home DNS Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/AdGuardHome
+ExecStart=/opt/AdGuardHome/AdGuardHome -c /opt/AdGuardHome/AdGuardHome.yaml -w /opt/AdGuardHome
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
