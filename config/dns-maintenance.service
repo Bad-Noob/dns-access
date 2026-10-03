@@ -1,0 +1,8 @@
+[Unit]
+Description=DNS Access Maintenance
+After=network-online.target dns-access.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/dns-access/venv/bin/python /opt/dns-access/app/app.py --maintenance
