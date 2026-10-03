@@ -2,23 +2,21 @@
 
 set -euo pipefail
 
-UNBOUND_BIN="/usr/sbin/unbound"
+CHECK_BIN="/usr/sbin/unbound-checkconf"
 CONFIG="/etc/unbound/unbound.conf"
 
-if [[ ! -x "$UNBOUND_BIN" ]]; then
-    echo "[ERROR] unbound binary not found."
+if [[ ! -x "$CHECK_BIN" ]]; then
+    echo "[ERROR] unbound-checkconf not found."
     exit 1
 fi
 
 if [[ ! -f "$CONFIG" ]]; then
-    echo "[ERROR] unbound configuration not found."
+    echo "[ERROR] Unbound configuration not found."
     exit 1
 fi
 
 echo "[INFO] Testing Unbound configuration..."
 
-"$UNBOUND_BIN" \
-    -c "$CONFIG" \
-    -t
+"$CHECK_BIN" "$CONFIG"
 
 echo "[OK] Unbound configuration is valid."
