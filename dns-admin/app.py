@@ -1,94 +1,37 @@
 #!/usr/bin/env python3
 
-import base64
 import hashlib
-import html
+import ipaddress
 import os
 import secrets
 import sqlite3
+import subprocess
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from cryptography.fernet import Fernet
-from flask import (
-    Flask,
-    redirect,
-    render_template_string,
-    request,
-    session,
-)
+from flask import Flask, redirect, render_template_string, request, session, url_for
 
 
-CONFIG_FILE = "/etc/dns-access.conf"
-ENV_FILE = "/etc/dns-admin.env"
 DB_FILE = "/opt/dns-access/data/users.db"
+NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
 
+HOST = os.getenv("DNS_ADMIN_HOST", "127.0.0.1")
+PORT = int(os.getenv("DNS_ADMIN_PORT", "8790"))
 
-def load_config():
-    config = {}
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
-    if not os.path.exists(CONFIG_FILE):
-        return config
+FLASK_SECRET = os.getenv("FLASK_SECRET", "")
+LINK_ENCRYPTION_KEY = os.getenv("LINK_ENCRYPTION_KEY", "")
 
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-
-            key, value = line.split("=", 1)
-            config[key.strip()] = value.strip().strip('"').strip("'")
-
-    return config
-
-
-def load_env():
-    values = {}
-
-    if not os.path.exists(ENV_FILE):
-        return values
-
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip('"').strip("'")
-
-    return values
-
-
-CONFIG = load_config()
-ENV = load_env()
-
-DOMAIN = CONFIG.get("DOMAIN", "")
-ADMIN_USER = ENV.get("ADMIN_USER", "")
-ADMIN_PASSWORD = ENV.get("ADMIN_PASSWORD", "")
-LINK_KEY = ENV.get("LINK_ENCRYPTION_KEY", "")
-
-BASE_URL = f"https://{DOMAIN}"
-
-
-if LINK_KEY:
-    FERNET = Fernet(LINK_KEY.encode())
-else:
-    FERNET = None
-
+if not FLASK_SECRET:
+    FLASK_SECRET = secrets.token_hex(32)
 
 app = Flask(__name__)
+app.secret_key = FLASK_SECRET
 
-app.secret_key = ENV.get(
-    "FLASK_SECRET",
-    secrets.token_hex(32),
-)
-
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SECURE"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+fernet = Fernet(LINK_ENCRYPTION_KEY) if LINK_ENCRYPTION_KEY else None
 
 
 def now_utc():
@@ -96,1039 +39,267 @@ def now_utc():
 
 
 def get_db():
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            token_hash TEXT NOT NULL UNIQUE,
-            expires_at TEXT NOT NULL,
-            ip4 TEXT,
-            ip6 TEXT,
-            disabled INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT
-        )
-        """
-    )
-
-    columns = {
-        row["name"]
-        for row in conn.execute(
-            "PRAGMA table_info(users)"
-        ).fetchall()
-    }
-
-    if "link_enc" not in columns:
-        conn.execute(
-            "ALTER TABLE users ADD COLUMN link_enc TEXT"
-        )
-
-    conn.commit()
-
     return conn
 
 
-def encrypt_link(link):
-    if not FERNET:
-        return ""
-
-    return FERNET.encrypt(
-        link.encode()
-    ).decode()
+def hash_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def decrypt_link(value):
-    if not value or not FERNET:
-        return ""
+def valid_ip(ip):
+    if not ip:
+        return False
 
     try:
-        return FERNET.decrypt(
-            value.encode()
-        ).decode()
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+def nft_delete_ip(ip):
+    if not valid_ip(ip):
+        return False
+
+    family = "dns6" if ":" in ip else "dns4"
+
+    try:
+        subprocess.run(
+            [
+                "/usr/sbin/nft",
+                "delete",
+                "element",
+                "inet",
+                "dnsaccess",
+                family,
+                "{",
+                ip,
+                "}",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
     except Exception:
-        return ""
+        return False
 
 
-def login_required():
-    if not session.get("authenticated"):
-        return redirect("/admin/login")
+def rebuild_nginx_allowlist(conn):
+    rows = conn.execute(
+        """
+        SELECT ip4, ip6
+        FROM users
+        WHERE disabled = 0
+          AND expires_at > ?
+        """,
+        (now_utc().isoformat(),),
+    ).fetchall()
 
-    return None
-
-
-def prepare_users(rows):
-    result = []
+    ips = set()
 
     for row in rows:
-        item = dict(row)
+        if valid_ip(row["ip4"]):
+            ips.add(row["ip4"])
 
-        item["link"] = decrypt_link(
-            item.get("link_enc", "")
+        if valid_ip(row["ip6"]):
+            ips.add(row["ip6"])
+
+    lines = [f"allow {ip};" for ip in sorted(ips)]
+    lines.append("deny all;")
+
+    os.makedirs(os.path.dirname(NGINX_ALLOW_FILE), exist_ok=True)
+
+    temp_file = NGINX_ALLOW_FILE + ".tmp"
+
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+        handle.write("\n")
+
+    os.replace(temp_file, NGINX_ALLOW_FILE)
+
+    if not os.path.exists("/etc/nginx/nginx.conf"):
+        return
+
+    try:
+        subprocess.run(
+            ["/usr/sbin/nginx", "-t"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
 
-        try:
-            expires = datetime.fromisoformat(
-                item["expires_at"].replace("Z", "+00:00")
-            )
-
-            if expires.tzinfo is None:
-                expires = expires.replace(
-                    tzinfo=timezone.utc
-                )
-
-            days_left = max(
-                0,
-                int(
-                    (
-                        expires - now_utc()
-                    ).total_seconds() / 86400
-                ),
-            )
-
-        except Exception:
-            days_left = 0
-
-        item["days_left"] = days_left
-        item["days_percent"] = min(
-            100,
-            int((days_left / 30) * 100),
+        subprocess.run(
+            ["/usr/bin/systemctl", "reload", "nginx"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-
-        result.append(item)
-
-    return result
+    except Exception:
+        pass
 
 
-HTML = """
-<!doctype html>
-<html lang="en">
-<head>
+def remove_user_ips(row):
+    for ip in (row["ip4"], row["ip6"]):
+        nft_delete_ip(ip)
 
-<meta charset="utf-8">
-<meta name="viewport"
-      content="width=device-width,initial-scale=1">
 
-<title>DNS Access Admin</title>
+def login_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if not session.get("authenticated"):
+            return redirect(url_for("login"))
 
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+BASE_STYLE = """
 <style>
-
 :root {
-    --bg:#f1f5f9;
-    --card:#ffffff;
-    --text:#0f172a;
-    --muted:#64748b;
-    --border:#e2e8f0;
-    --input:#ffffff;
-    --primary:#6366f1;
-    --primary2:#4f46e5;
-    --green:#16a34a;
-    --red:#dc2626;
-    --orange:#d97706;
-    --shadow:0 10px 30px rgba(15,23,42,.08);
-}
-
-[data-theme="dark"] {
-    --bg:#0b1120;
-    --card:#111827;
-    --text:#f8fafc;
-    --muted:#94a3b8;
-    --border:#263244;
-    --input:#0f172a;
-    --primary:#818cf8;
-    --primary2:#6366f1;
-    --green:#4ade80;
-    --red:#f87171;
-    --orange:#fbbf24;
-    --shadow:0 15px 40px rgba(0,0,0,.35);
+    color-scheme: dark;
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card2: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --danger: #f87171;
+    --success: #4ade80;
 }
 
 * {
-    box-sizing:border-box;
+    box-sizing: border-box;
 }
 
 body {
-    margin:0;
-    background:var(--bg);
-    color:var(--text);
-    font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Arial, sans-serif;
 }
 
 .container {
-    width:min(1450px, calc(100% - 32px));
-    margin:30px auto;
-}
-
-.topbar {
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:15px;
-    margin-bottom:24px;
-}
-
-.brand h1 {
-    margin:0;
-    font-size:27px;
-}
-
-.brand p {
-    margin:5px 0 0;
-    color:var(--muted);
-    font-size:13px;
-}
-
-.top-actions {
-    display:flex;
-    gap:8px;
-}
-
-button,
-input {
-    font:inherit;
-}
-
-.btn {
-    border:1px solid var(--border);
-    background:var(--card);
-    color:var(--text);
-    border-radius:10px;
-    padding:9px 13px;
-    cursor:pointer;
-}
-
-.btn.primary {
-    background:var(--primary);
-    border-color:var(--primary);
-    color:white;
-}
-
-.btn.danger {
-    color:var(--red);
-}
-
-.stats {
-    display:grid;
-    grid-template-columns:
-        repeat(3, minmax(0,1fr));
-    gap:14px;
-    margin-bottom:18px;
-}
-
-.stat {
-    background:var(--card);
-    border:1px solid var(--border);
-    border-radius:18px;
-    padding:18px;
-    box-shadow:var(--shadow);
-}
-
-.stat-label {
-    color:var(--muted);
-    font-size:12px;
-    font-weight:700;
-}
-
-.stat-value {
-    margin-top:7px;
-    font-size:28px;
-    font-weight:800;
+    width: min(1180px, 94%);
+    margin: 40px auto;
 }
 
 .card {
-    background:var(--card);
-    border:1px solid var(--border);
-    border-radius:20px;
-    box-shadow:var(--shadow);
-    padding:20px;
-    margin-bottom:18px;
+    background: var(--card);
+    border-radius: 18px;
+    padding: 24px;
+    margin-bottom: 20px;
+    box-shadow: 0 12px 35px rgba(0,0,0,.25);
 }
 
-.card h2 {
-    margin:0 0 15px;
-    font-size:18px;
+h1, h2, h3 {
+    margin-top: 0;
 }
 
-.add-form {
-    display:grid;
-    grid-template-columns:
-        1fr 180px auto;
-    gap:10px;
-}
-
-.input {
-    width:100%;
-    border:1px solid var(--border);
-    background:var(--input);
-    color:var(--text);
-    border-radius:10px;
-    padding:11px 12px;
-    outline:none;
-}
-
-.input:focus {
-    border-color:var(--primary);
-}
-
-.search {
-    margin-bottom:14px;
-}
-
-.table-wrap {
-    overflow:auto;
-}
-
-table {
-    width:100%;
-    border-collapse:collapse;
-    min-width:1050px;
-}
-
-th,
-td {
-    padding:13px 10px;
-    border-bottom:1px solid var(--border);
-    text-align:left;
-    vertical-align:middle;
-}
-
-th {
-    color:var(--muted);
-    font-size:11px;
-    text-transform:uppercase;
-    letter-spacing:.04em;
-}
-
-.user {
-    font-weight:700;
-}
-
-.ip {
-    font-family:
-        ui-monospace,
-        SFMono-Regular,
-        Menlo,
-        monospace;
-    font-size:12px;
-}
-
-.modern-link {
-    display:flex;
-    align-items:center;
-    gap:8px;
-    min-width:260px;
-    max-width:360px;
-    padding:8px 10px;
-    border:1px solid var(--border);
-    border-radius:12px;
-    background:var(--card);
-}
-
-.link-text {
-    flex:1;
-    min-width:0;
-    overflow:hidden;
-    text-overflow:ellipsis;
-    white-space:nowrap;
-    font-family:
-        ui-monospace,
-        SFMono-Regular,
-        Menlo,
-        monospace;
-    font-size:12px;
-}
-
-.link-copy {
-    flex:none;
-    padding:7px 11px;
-    border:0;
-    border-radius:9px;
-    background:var(--primary);
-    color:white;
-    font-size:12px;
-    font-weight:700;
-    cursor:pointer;
-}
-
-.days-wrap {
-    display:flex;
-    align-items:center;
-    gap:8px;
-}
-
-.days-ring {
-    --size:48px;
-    width:var(--size);
-    height:var(--size);
-    border-radius:50%;
-    display:grid;
-    place-items:center;
-    position:relative;
-    background:
-        conic-gradient(
-            var(--primary)
-            var(--progress),
-            var(--border) 0
-        );
-}
-
-.days-ring::before {
-    content:"";
-    position:absolute;
-    inset:5px;
-    border-radius:50%;
-    background:var(--card);
-}
-
-.days-ring span {
-    position:relative;
-    z-index:1;
-    font-size:13px;
-    font-weight:800;
-}
-
-.days-label {
-    font-size:11px;
-    color:var(--muted);
-    font-weight:600;
-}
-
-.badge {
-    display:inline-block;
-    padding:5px 9px;
-    border-radius:999px;
-    font-size:11px;
-    font-weight:700;
-}
-
-.badge.active {
-    color:var(--green);
-    background:rgba(22,163,74,.10);
-}
-
-.badge.disabled {
-    color:var(--red);
-    background:rgba(220,38,38,.10);
-}
-
-.badge.expired {
-    color:var(--orange);
-    background:rgba(217,119,6,.10);
-}
-
-.actions {
-    display:flex;
-    flex-wrap:wrap;
-    gap:6px;
-}
-
-.action {
-    border:1px solid var(--border);
-    background:var(--card);
-    color:var(--text);
-    border-radius:8px;
-    padding:7px 9px;
-    cursor:pointer;
-    font-size:11px;
-}
-
-.action.danger {
-    color:var(--red);
-}
-
-.notice {
-    padding:12px 14px;
-    border-radius:12px;
-    margin-bottom:18px;
-    background:rgba(99,102,241,.10);
-    color:var(--text);
-    font-size:13px;
-}
-
-@media(max-width:800px) {
-    .stats {
-        grid-template-columns:1fr;
-    }
-
-    .add-form {
-        grid-template-columns:1fr;
-    }
-
-    .topbar {
-        align-items:flex-start;
-        flex-direction:column;
-    }
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-<div class="topbar">
-
-<div class="brand">
-    <h1>DNS Access Admin</h1>
-    <p>User and access management</p>
-</div>
-
-<div class="top-actions">
-
-<button
-    class="btn"
-    id="themeBtn"
-    onclick="toggleTheme()">
-    🌙 Dark
-</button>
-
-<a
-    class="btn"
-    href="/admin/logout">
-    Logout
-</a>
-
-</div>
-
-</div>
-
-{% if message %}
-<div class="notice">
-    {{ message }}
-</div>
-{% endif %}
-
-<div class="stats">
-
-<div class="stat">
-    <div class="stat-label">TOTAL USERS</div>
-    <div class="stat-value">{{ total }}</div>
-</div>
-
-<div class="stat">
-    <div class="stat-label">ACTIVE</div>
-    <div class="stat-value">{{ active }}</div>
-</div>
-
-<div class="stat">
-    <div class="stat-label">DISABLED</div>
-    <div class="stat-value">{{ disabled }}</div>
-</div>
-
-</div>
-
-<div class="card">
-
-<h2>Add User</h2>
-
-<form
-    class="add-form"
-    method="post"
-    action="/admin/add">
-
-<input
-    class="input"
-    type="text"
-    name="username"
-    placeholder="Username"
-    required>
-
-<input
-    class="input"
-    type="number"
-    name="days"
-    min="1"
-    value="30"
-    placeholder="Days"
-    required>
-
-<button
-    class="btn primary"
-    type="submit">
-    Create User
-</button>
-
-</form>
-
-</div>
-
-<div class="card">
-
-<h2>Users</h2>
-
-<form method="get" class="search">
-<input
-    class="input"
-    name="q"
-    value="{{ q }}"
-    placeholder="Search users...">
-</form>
-
-<div class="table-wrap">
-
-<table>
-
-<tr>
-<th>ID</th>
-<th>User</th>
-<th>Access Link</th>
-<th>Remaining</th>
-<th>IPv4</th>
-<th>Status</th>
-<th>Actions</th>
-</tr>
-
-{% for u in users %}
-
-<tr>
-
-<td>{{ u.id }}</td>
-
-<td class="user">
-    {{ u.username }}
-</td>
-
-<td>
-
-<div class="modern-link">
-
-<div
-    class="link-text"
-    title="{{ u.link }}">
-    {{ u.link[:38] }}
-    {% if u.link|length > 38 %}...{% endif %}
-</div>
-
-<button
-    class="link-copy"
-    onclick="copyLink('{{ u.link|e }}', this)"
-    type="button">
-    Copy
-</button>
-
-</div>
-
-</td>
-
-<td>
-
-<div class="days-wrap">
-
-<div
-    class="days-ring"
-    style="--progress: {{ u.days_percent }}%;">
-    <span>{{ u.days_left }}</span>
-</div>
-
-<div class="days-label">
-    days
-</div>
-
-</div>
-
-</td>
-
-<td class="ip">
-    {{ u.ip4 or "-" }}
-</td>
-
-<td>
-
-{% if u.disabled %}
-
-<span class="badge disabled">
-    Disabled
-</span>
-
-{% elif u.expires_at <= now %}
-
-<span class="badge expired">
-    Expired
-</span>
-
-{% else %}
-
-<span class="badge active">
-    Active
-</span>
-
-{% endif %}
-
-</td>
-
-<td>
-
-<div class="actions">
-
-<form
-    method="post"
-    action="/admin/renew/{{ u.id }}"
-    onsubmit="return confirm('Renew {{ u.username }} for 30 days?')">
-
-<button
-    class="action"
-    type="submit">
-    ↻ Renew
-</button>
-
-</form>
-
-{% if u.disabled %}
-
-<form
-    method="post"
-    action="/admin/enable/{{ u.id }}"
-    onsubmit="return confirm('Enable {{ u.username }}?')">
-
-<button
-    class="action"
-    type="submit">
-    ▶ Enable
-</button>
-
-</form>
-
-{% else %}
-
-<form
-    method="post"
-    action="/admin/disable/{{ u.id }}"
-    onsubmit="return confirm('Disable {{ u.username }}?')">
-
-<button
-    class="action"
-    type="submit">
-    ⏸ Disable
-</button>
-
-</form>
-
-{% endif %}
-
-<form
-    method="post"
-    action="/admin/delete/{{ u.id }}"
-    onsubmit="return confirm('DELETE {{ u.username }} permanently?')">
-
-<button
-    class="action danger"
-    type="submit">
-    ✕ Delete
-</button>
-
-</form>
-
-</div>
-
-</td>
-
-</tr>
-
-{% endfor %}
-
-{% if not users %}
-
-<tr>
-
-<td
-    colspan="7"
-    style="text-align:center;color:var(--muted);padding:35px">
-
-No users found.
-
-</td>
-
-</tr>
-
-{% endif %}
-
-</table>
-
-</div>
-
-</div>
-
-</div>
-
-<script>
-
-function toggleTheme() {
-
-    const html =
-        document.documentElement;
-
-    const dark =
-        html.getAttribute("data-theme")
-        === "dark";
-
-    if (dark) {
-
-        html.removeAttribute("data-theme");
-
-        localStorage.setItem(
-            "dns-theme",
-            "light"
-        );
-
-    } else {
-
-        html.setAttribute(
-            "data-theme",
-            "dark"
-        );
-
-        localStorage.setItem(
-            "dns-theme",
-            "dark"
-        );
-    }
-
-    updateThemeButton();
-}
-
-
-function updateThemeButton() {
-
-    const dark =
-        document.documentElement
-        .getAttribute("data-theme")
-        === "dark";
-
-    document.getElementById(
-        "themeBtn"
-    ).textContent =
-        dark ? "☀️ Light" : "🌙 Dark";
-}
-
-
-if (
-    localStorage.getItem("dns-theme")
-    === "dark"
-) {
-    document.documentElement
-        .setAttribute(
-            "data-theme",
-            "dark"
-        );
-}
-
-
-updateThemeButton();
-
-
-async function copyLink(link, button) {
-
-    try {
-
-        await navigator.clipboard
-            .writeText(link);
-
-        const old =
-            button.textContent;
-
-        button.textContent =
-            "✓ Copied";
-
-        setTimeout(
-            () => button.textContent = old,
-            1500
-        );
-
-    } catch {
-
-        prompt(
-            "Copy this link:",
-            link
-        );
-    }
-}
-
-</script>
-
-</body>
-</html>
-"""
-
-
-LOGIN_HTML = """
-<!doctype html>
-<html lang="en">
-
-<head>
-
-<meta charset="utf-8">
-<meta name="viewport"
-      content="width=device-width,initial-scale=1">
-
-<title>Admin Login</title>
-
-<style>
-
-:root {
-    --bg:#f1f5f9;
-    --card:#ffffff;
-    --text:#0f172a;
-    --muted:#64748b;
-    --border:#e2e8f0;
-    --primary:#6366f1;
-}
-
-[data-theme="dark"] {
-    --bg:#0b1120;
-    --card:#111827;
-    --text:#f8fafc;
-    --muted:#94a3b8;
-    --border:#263244;
-    --primary:#818cf8;
-}
-
-* {
-    box-sizing:border-box;
-}
-
-body {
-    margin:0;
-    min-height:100vh;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    padding:20px;
-    background:var(--bg);
-    color:var(--text);
-    font-family:
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-}
-
-.card {
-    width:100%;
-    max-width:400px;
-    padding:28px;
-    background:var(--card);
-    border:1px solid var(--border);
-    border-radius:22px;
-}
-
-h1 {
-    margin:0 0 8px;
-    text-align:center;
-}
-
-p {
-    margin:0 0 22px;
-    color:var(--muted);
-    text-align:center;
-    font-size:13px;
-}
-
-.input {
-    width:100%;
-    margin-bottom:10px;
-    padding:12px;
-    border:1px solid var(--border);
-    border-radius:10px;
-    background:var(--card);
-    color:var(--text);
+input, button {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid #475569;
+    background: #0f172a;
+    color: var(--text);
 }
 
 button {
-    width:100%;
-    padding:12px;
-    border:0;
-    border-radius:10px;
-    background:var(--primary);
-    color:white;
-    font-weight:700;
-    cursor:pointer;
+    background: var(--accent);
+    color: #082f49;
+    font-weight: bold;
+    cursor: pointer;
+    border: 0;
+}
+
+button.danger {
+    background: var(--danger);
+    color: #450a0a;
+}
+
+button.success {
+    background: var(--success);
+    color: #052e16;
+}
+
+form {
+    margin-bottom: 12px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    padding: 12px 8px;
+    border-bottom: 1px solid #334155;
+    text-align: left;
+    vertical-align: top;
+}
+
+small {
+    color: var(--muted);
+}
+
+a {
+    color: var(--accent);
+}
+
+.badge {
+    display: inline-block;
+    padding: 5px 9px;
+    border-radius: 999px;
+    background: var(--card2);
 }
 
 .error {
-    margin-bottom:12px;
-    padding:10px;
-    border-radius:9px;
-    background:rgba(220,38,38,.10);
-    color:#dc2626;
-    font-size:12px;
-    text-align:center;
+    color: var(--danger);
 }
 
+.success-text {
+    color: var(--success);
+}
 </style>
+"""
 
+
+LOGIN_HTML = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DNS Access Admin</title>
+{BASE_STYLE}
 </head>
-
 <body>
-
-<div class="card">
-
-<h1>DNS Access Admin</h1>
-
-<p>
-    Sign in to continue
-</p>
-
-{% if error %}
-<div class="error">
-    {{ error }}
-</div>
-{% endif %}
-
+<div class="container">
+<div class="card" style="max-width:440px;margin:80px auto;">
+<h1>DNS Access</h1>
+<h2>Administrator Login</h2>
 <form method="post">
-
-<input
-    class="input"
-    type="text"
-    name="username"
-    placeholder="Username"
-    autocomplete="username"
-    required>
-
-<input
-    class="input"
-    type="password"
-    name="password"
-    placeholder="Password"
-    autocomplete="current-password"
-    required>
-
-<button type="submit">
-    Sign in
-</button>
-
+<input name="username" placeholder="Username" required>
+<br><br>
+<input type="password" name="password" placeholder="Password" required>
+<br><br>
+<button type="submit">Sign in</button>
 </form>
-
+{{% if error %}}
+<p class="error">{{{{ error }}}}</p>
+{{% endif %}}
 </div>
-
-<script>
-
-if (
-    localStorage.getItem("dns-theme")
-    === "dark"
-) {
-    document.documentElement
-        .setAttribute(
-            "data-theme",
-            "dark"
-        );
-}
-
-</script>
-
+</div>
 </body>
 </html>
 """
@@ -1136,478 +307,409 @@ if (
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def login():
+    error = None
 
     if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
 
-        username = request.form.get(
-            "username",
-            "",
-        ).strip()
-
-        password = request.form.get(
-            "password",
-            "",
-        )
-
-        if (
-            secrets.compare_digest(
-                username,
-                ADMIN_USER,
-            )
-            and secrets.compare_digest(
-                password,
-                ADMIN_PASSWORD,
-            )
-        ):
-
-            session.clear()
+        if username == ADMIN_USER and password == ADMIN_PASSWORD:
             session["authenticated"] = True
+            return redirect(url_for("dashboard"))
 
-            return redirect("/admin/")
+        error = "Invalid username or password."
 
-        return render_template_string(
-            LOGIN_HTML,
-            error="Invalid username or password.",
-        )
-
-    return render_template_string(
-        LOGIN_HTML,
-        error=None,
-    )
+    return render_template_string(LOGIN_HTML, error=error)
 
 
 @app.route("/admin/logout")
 def logout():
-
     session.clear()
-
-    return redirect("/admin/login")
+    return redirect(url_for("login"))
 
 
 @app.route("/admin/")
-def index():
-
-    denied = login_required()
-
-    if denied:
-        return denied
-
-    q = request.args.get(
-        "q",
-        "",
-    ).strip()
-
+@login_required
+def dashboard():
     conn = get_db()
 
-    if q:
-
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE username LIKE ?
-            ORDER BY id DESC
-            """,
-            (f"%{q}%",),
-        ).fetchall()
-
-    else:
-
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM users
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    stats = conn.execute(
+    rows = conn.execute(
         """
-        SELECT
-            COUNT(*) AS total,
-            SUM(
-                CASE
-                    WHEN disabled = 0
-                     AND expires_at > ?
-                    THEN 1 ELSE 0
-                END
-            ) AS active,
-            SUM(
-                CASE
-                    WHEN disabled = 1
-                    THEN 1 ELSE 0
-                END
-            ) AS disabled
+        SELECT *
         FROM users
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
+    active = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        WHERE disabled = 0
+          AND expires_at > ?
         """,
         (now_utc().isoformat(),),
-    ).fetchone()
+    ).fetchone()[0]
+
+    disabled = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        WHERE disabled = 1
+        """
+    ).fetchone()[0]
+
+    expired = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        WHERE expires_at <= ?
+        """,
+        (now_utc().isoformat(),),
+    ).fetchone()[0]
 
     conn.close()
 
-    users = prepare_users(rows)
-
     return render_template_string(
-        HTML,
-        users=users,
-        q=q,
+        """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DNS Access Admin</title>
+{{ style|safe }}
+</head>
+<body>
+<div class="container">
+
+<div class="card">
+<h1>DNS Access Admin</h1>
+<p>
+<a href="{{ url_for('logout') }}">Logout</a>
+</p>
+</div>
+
+<div class="grid">
+<div class="card">
+<small>Total</small>
+<h2>{{ total }}</h2>
+</div>
+
+<div class="card">
+<small>Active</small>
+<h2>{{ active }}</h2>
+</div>
+
+<div class="card">
+<small>Disabled</small>
+<h2>{{ disabled }}</h2>
+</div>
+
+<div class="card">
+<small>Expired</small>
+<h2>{{ expired }}</h2>
+</div>
+</div>
+
+<div class="card">
+<h2>Create User</h2>
+
+<form method="post" action="{{ url_for('create_user') }}">
+<div class="grid">
+
+<div>
+<label>Username</label>
+<input name="username" required>
+</div>
+
+<div>
+<label>Days</label>
+<input type="number" name="days" value="30" min="1" max="3650" required>
+</div>
+
+</div>
+
+<br>
+
+<button type="submit">Create User</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Users</h2>
+
+{% if rows %}
+<table>
+<thead>
+<tr>
+<th>User</th>
+<th>Expires</th>
+<th>IPv4</th>
+<th>IPv6</th>
+<th>Status</th>
+<th>Actions</th>
+</tr>
+</thead>
+
+<tbody>
+
+{% for row in rows %}
+
+<tr>
+<td>
+<strong>{{ row["username"] }}</strong>
+<br>
+<small>ID {{ row["id"] }}</small>
+</td>
+
+<td>
+{{ row["expires_at"] }}
+</td>
+
+<td>
+{{ row["ip4"] or "-" }}
+</td>
+
+<td>
+{{ row["ip6"] or "-" }}
+</td>
+
+<td>
+{% if row["disabled"] %}
+<span class="badge">Disabled</span>
+{% elif row["expires_at"] <= now %}
+<span class="badge">Expired</span>
+{% else %}
+<span class="badge">Active</span>
+{% endif %}
+</td>
+
+<td>
+
+<form method="post" action="{{ url_for('renew_user', user_id=row['id']) }}">
+<button class="success" type="submit">Renew 30d</button>
+</form>
+
+<form method="post" action="{{ url_for('toggle_user', user_id=row['id']) }}">
+<button type="submit">
+{% if row["disabled"] %}Enable{% else %}Disable{% endif %}
+</button>
+</form>
+
+<form method="post" action="{{ url_for('delete_user', user_id=row['id']) }}">
+<button class="danger" type="submit">Delete</button>
+</form>
+
+{% if row["link_enc"] %}
+<form method="get" action="{{ url_for('show_link', user_id=row['id']) }}">
+<button type="submit">Show Link</button>
+</form>
+{% endif %}
+
+</td>
+</tr>
+
+{% endfor %}
+
+</tbody>
+</table>
+
+{% else %}
+
+<p>No users found.</p>
+
+{% endif %}
+
+</div>
+</div>
+</body>
+</html>
+        """,
+        style=BASE_STYLE,
+        rows=rows,
+        total=total,
+        active=active,
+        disabled=disabled,
+        expired=expired,
         now=now_utc().isoformat(),
-        total=stats["total"] or 0,
-        active=stats["active"] or 0,
-        disabled=stats["disabled"] or 0,
-        message=request.args.get("message", ""),
     )
 
 
-@app.route(
-    "/admin/add",
-    methods=["POST"],
-)
-def add_user():
-
-    denied = login_required()
-
-    if denied:
-        return denied
-
-    username = request.form.get(
-        "username",
-        "",
-    ).strip()
-
-    days = request.form.get(
-        "days",
-        "",
-    ).strip()
+@app.route("/admin/create", methods=["POST"])
+@login_required
+def create_user():
+    username = request.form.get("username", "").strip()
+    days_raw = request.form.get("days", "30")
 
     if not username:
-        return "Invalid username", 400
+        return redirect(url_for("dashboard"))
 
-    if not days.isdigit():
-        return "Invalid days", 400
+    try:
+        days = int(days_raw)
+    except ValueError:
+        days = 30
 
-    days = int(days)
-
-    if days < 1 or days > 3650:
-        return "Invalid days", 400
+    days = max(1, min(days, 3650))
 
     token = secrets.token_urlsafe(32)
+    token_hash = hash_token(token)
 
-    token_hash = hashlib.sha256(
-        token.encode()
-    ).hexdigest()
+    created_at = now_utc()
+    expires_at = created_at + timedelta(days=days)
 
-    expires = (
-        now_utc()
-        + timedelta(days=days)
-    ).isoformat()
+    encrypted_link = None
 
-    link = (
-        BASE_URL
-        + "/join/"
-        + token
-    )
-
-    link_enc = encrypt_link(link)
+    if fernet:
+        link = f"/join/{token}"
+        encrypted_link = fernet.encrypt(link.encode()).decode()
 
     conn = get_db()
 
     try:
-
         conn.execute(
             """
-            INSERT INTO users
-            (
+            INSERT INTO users (
                 username,
                 token_hash,
                 expires_at,
+                ip4,
+                ip6,
                 disabled,
                 created_at,
                 updated_at,
                 link_enc
             )
-            VALUES (?, ?, ?, 0, ?, ?, ?)
+            VALUES (?, ?, ?, NULL, NULL, 0, ?, ?, ?)
             """,
             (
                 username,
                 token_hash,
-                expires,
-                now_utc().isoformat(),
-                now_utc().isoformat(),
-                link_enc,
+                expires_at.isoformat(),
+                created_at.isoformat(),
+                created_at.isoformat(),
+                encrypted_link,
             ),
         )
 
         conn.commit()
 
     except sqlite3.IntegrityError:
-
         conn.close()
+        return redirect(url_for("dashboard"))
 
-        return "Username already exists", 409
+    conn.close()
 
-    finally:
+    return redirect(url_for("show_new_link", token=token))
 
-        conn.close()
+
+@app.route("/admin/new-link")
+@login_required
+def show_new_link():
+    token = request.args.get("token", "").strip()
+
+    if not token:
+        return redirect(url_for("dashboard"))
+
+    domain = request.host.split(":")[0]
+    link = f"https://{domain}/join/{token}"
 
     return render_template_string(
+        f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access Link</title>
+{BASE_STYLE}
+</head>
+<body>
+<div class="container">
+<div class="card">
+<h1>Access Link Created</h1>
+<p>Save this link and give it to the user.</p>
+<input value="{link}" readonly>
+<br><br>
+<a href="/admin/">Back to dashboard</a>
+</div>
+</div>
+</body>
+</html>
         """
-        <!doctype html>
-        <html>
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width,initial-scale=1">
-        <title>User Created</title>
-
-        <style>
-
-        :root {
-            --bg:#f1f5f9;
-            --card:#ffffff;
-            --text:#0f172a;
-            --muted:#64748b;
-            --border:#e2e8f0;
-            --primary:#6366f1;
-            --green:#16a34a;
-        }
-
-        [data-theme="dark"] {
-            --bg:#0b1120;
-            --card:#111827;
-            --text:#f8fafc;
-            --muted:#94a3b8;
-            --border:#263244;
-            --primary:#818cf8;
-            --green:#4ade80;
-        }
-
-        * {
-            box-sizing:border-box;
-        }
-
-        body {
-            margin:0;
-            min-height:100vh;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            padding:20px;
-            background:var(--bg);
-            color:var(--text);
-            font-family:system-ui,sans-serif;
-        }
-
-        .card {
-            width:100%;
-            max-width:600px;
-            padding:28px;
-            background:var(--card);
-            border:1px solid var(--border);
-            border-radius:22px;
-        }
-
-        .icon {
-            width:58px;
-            height:58px;
-            margin:0 auto 15px;
-            display:grid;
-            place-items:center;
-            border-radius:50%;
-            background:rgba(22,163,74,.10);
-            color:var(--green);
-            font-size:27px;
-            font-weight:800;
-        }
-
-        h1 {
-            margin:0;
-            text-align:center;
-        }
-
-        .subtitle {
-            margin:8px 0 22px;
-            text-align:center;
-            color:var(--muted);
-        }
-
-        .box {
-            padding:15px;
-            border:1px solid var(--border);
-            border-radius:13px;
-            margin-bottom:10px;
-        }
-
-        .label {
-            display:block;
-            margin-bottom:7px;
-            color:var(--muted);
-            font-size:11px;
-            font-weight:700;
-            text-transform:uppercase;
-        }
-
-        .link {
-            word-break:break-all;
-            font-family:monospace;
-            font-size:13px;
-        }
-
-        .copy {
-            width:100%;
-            margin-top:10px;
-            padding:11px;
-            border:0;
-            border-radius:10px;
-            background:var(--primary);
-            color:white;
-            font-weight:700;
-            cursor:pointer;
-        }
-
-        .back {
-            display:block;
-            margin-top:15px;
-            text-align:center;
-            color:var(--primary);
-            text-decoration:none;
-        }
-
-        </style>
-        </head>
-
-        <body>
-
-        <div class="card">
-
-        <div class="icon">✓</div>
-
-        <h1>User Created</h1>
-
-        <p class="subtitle">
-            The access link has been generated successfully.
-        </p>
-
-        <div class="box">
-            <span class="label">Username</span>
-            {{ username }}
-        </div>
-
-        <div class="box">
-            <span class="label">Expires</span>
-            {{ expires }}
-        </div>
-
-        <div class="box">
-
-            <span class="label">
-                Access Link
-            </span>
-
-            <div
-                class="link"
-                id="link">
-                {{ link }}
-            </div>
-
-            <button
-                class="copy"
-                onclick="copyLink()">
-                Copy Access Link
-            </button>
-
-        </div>
-
-        <a
-            class="back"
-            href="/admin/">
-            ← Back to Admin
-        </a>
-
-        </div>
-
-        <script>
-
-        if (
-            localStorage.getItem("dns-theme")
-            === "dark"
-        ) {
-            document.documentElement
-                .setAttribute(
-                    "data-theme",
-                    "dark"
-                );
-        }
-
-        async function copyLink() {
-
-            const link =
-                document.getElementById(
-                    "link"
-                ).textContent.trim();
-
-            await navigator.clipboard
-                .writeText(link);
-
-            alert("Link copied.");
-
-        }
-
-        </script>
-
-        </body>
-        </html>
-        """,
-        username=html.escape(username),
-        expires=html.escape(expires),
-        link=html.escape(link),
     )
 
 
-@app.route(
-    "/admin/renew/<int:user_id>",
-    methods=["POST"],
-)
-def renew(user_id):
-
-    denied = login_required()
-
-    if denied:
-        return denied
-
+@app.route("/admin/user/<int:user_id>/link")
+@login_required
+def show_link(user_id):
     conn = get_db()
 
     row = conn.execute(
+        "SELECT link_enc FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if not row or not row["link_enc"] or not fernet:
+        return redirect(url_for("dashboard"))
+
+    try:
+        link = fernet.decrypt(row["link_enc"].encode()).decode()
+    except Exception:
+        return redirect(url_for("dashboard"))
+
+    domain = request.host.split(":")[0]
+    full_link = f"https://{domain}{link}"
+
+    return render_template_string(
+        f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access Link</title>
+{BASE_STYLE}
+</head>
+<body>
+<div class="container">
+<div class="card">
+<h1>Access Link</h1>
+<input value="{full_link}" readonly>
+<br><br>
+<a href="/admin/">Back to dashboard</a>
+</div>
+</div>
+</body>
+</html>
         """
-        SELECT expires_at
-        FROM users
-        WHERE id = ?
-        """,
+    )
+
+
+@app.route("/admin/user/<int:user_id>/renew", methods=["POST"])
+@login_required
+def renew_user(user_id):
+    conn = get_db()
+
+    row = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
         (user_id,),
     ).fetchone()
 
     if row:
+        current_expiry = datetime.fromisoformat(row["expires_at"])
 
-        try:
-            expires = datetime.fromisoformat(
-                row["expires_at"].replace(
-                    "Z",
-                    "+00:00",
-                )
-            )
+        if current_expiry.tzinfo is None:
+            current_expiry = current_expiry.replace(tzinfo=timezone.utc)
 
-            if expires.tzinfo is None:
-                expires = expires.replace(
-                    tzinfo=timezone.utc
-                )
-
-        except ValueError:
-            expires = now_utc()
-
-        if expires < now_utc():
-            expires = now_utc()
-
-        expires += timedelta(days=30)
+        base = max(current_expiry, now_utc())
+        new_expiry = base + timedelta(days=30)
 
         conn.execute(
             """
@@ -1617,7 +719,7 @@ def renew(user_id):
             WHERE id = ?
             """,
             (
-                expires.isoformat(),
+                new_expiry.isoformat(),
                 now_utc().isoformat(),
                 user_id,
             ),
@@ -1627,112 +729,78 @@ def renew(user_id):
 
     conn.close()
 
-    return redirect(
-        "/admin/?message=User renewed"
-    )
+    return redirect(url_for("dashboard"))
 
 
-@app.route(
-    "/admin/disable/<int:user_id>",
-    methods=["POST"],
-)
-def disable(user_id):
-
-    denied = login_required()
-
-    if denied:
-        return denied
-
+@app.route("/admin/user/<int:user_id>/toggle", methods=["POST"])
+@login_required
+def toggle_user(user_id):
     conn = get_db()
 
-    conn.execute(
-        """
-        UPDATE users
-        SET disabled = 1,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            now_utc().isoformat(),
-            user_id,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    return redirect(
-        "/admin/?message=User disabled"
-    )
-
-
-@app.route(
-    "/admin/enable/<int:user_id>",
-    methods=["POST"],
-)
-def enable(user_id):
-
-    denied = login_required()
-
-    if denied:
-        return denied
-
-    conn = get_db()
-
-    conn.execute(
-        """
-        UPDATE users
-        SET disabled = 0,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            now_utc().isoformat(),
-            user_id,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    return redirect(
-        "/admin/?message=User enabled"
-    )
-
-
-@app.route(
-    "/admin/delete/<int:user_id>",
-    methods=["POST"],
-)
-def delete_user(user_id):
-
-    denied = login_required()
-
-    if denied:
-        return denied
-
-    conn = get_db()
-
-    conn.execute(
-        """
-        DELETE FROM users
-        WHERE id = ?
-        """,
+    row = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
         (user_id,),
-    )
+    ).fetchone()
 
-    conn.commit()
+    if row:
+        new_disabled = 0 if row["disabled"] else 1
+
+        conn.execute(
+            """
+            UPDATE users
+            SET disabled = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                new_disabled,
+                now_utc().isoformat(),
+                user_id,
+            ),
+        )
+
+        conn.commit()
+
+        if new_disabled:
+            remove_user_ips(row)
+
+        rebuild_nginx_allowlist(conn)
+
     conn.close()
 
-    return redirect(
-        "/admin/?message=User deleted"
-    )
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/user/<int:user_id>/delete", methods=["POST"])
+@login_required
+def delete_user(user_id):
+    conn = get_db()
+
+    row = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+
+    if row:
+        remove_user_ips(row)
+
+        conn.execute(
+            "DELETE FROM users WHERE id = ?",
+            (user_id,),
+        )
+
+        conn.commit()
+
+        rebuild_nginx_allowlist(conn)
+
+    conn.close()
+
+    return redirect(url_for("dashboard"))
 
 
 if __name__ == "__main__":
-
     app.run(
-        host="127.0.0.1",
-        port=8790,
+        host=HOST,
+        port=PORT,
         debug=False,
     )
