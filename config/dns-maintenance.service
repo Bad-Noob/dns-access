@@ -5,4 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/dns-access/venv/bin/python /opt/dns-access/app/app.py --maintenance
+User=root
+Group=root
+ExecStart=/opt/dns-access/venv/bin/python /opt/dns-access/app/maintenance.py
