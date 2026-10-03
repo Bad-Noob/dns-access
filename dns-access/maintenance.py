@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
+import ipaddress
 import os
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
-
 
 DB_FILE = "/opt/dns-access/data/users.db"
 NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
@@ -24,8 +24,6 @@ def valid_ip(ip):
     if not ip:
         return False
 
-    import ipaddress
-
     try:
         ipaddress.ip_address(ip)
         return True
@@ -44,6 +42,27 @@ def run(command):
         return True
     except Exception:
         return False
+
+
+def nft_delete_ip(ip):
+    if not valid_ip(ip):
+        return False
+
+    family = "dns6" if ":" in ip else "dns4"
+
+    return run(
+        [
+            "/usr/sbin/nft",
+            "delete",
+            "element",
+            "inet",
+            "dnsaccess",
+            family,
+            "{",
+            ip,
+            "}",
+        ]
+    )
 
 
 def rebuild_nginx_allowlist(conn):
@@ -66,47 +85,26 @@ def rebuild_nginx_allowlist(conn):
         if valid_ip(row["ip6"]):
             ips.add(row["ip6"])
 
-    lines = [
-        f"allow {ip};"
-        for ip in sorted(ips)
-    ]
-
+    lines = [f"allow {ip};" for ip in sorted(ips)]
     lines.append("deny all;")
 
-    os.makedirs(
-        os.path.dirname(NGINX_ALLOW_FILE),
-        exist_ok=True,
-    )
+    os.makedirs(os.path.dirname(NGINX_ALLOW_FILE), exist_ok=True)
 
     temp_file = NGINX_ALLOW_FILE + ".tmp"
 
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        f.write("\n".join(lines))
-        f.write("\n")
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+        handle.write("\n")
 
-    os.replace(
-        temp_file,
-        NGINX_ALLOW_FILE,
-    )
+    os.replace(temp_file, NGINX_ALLOW_FILE)
 
-    run(
-        [
-            "/usr/sbin/nginx",
-            "-t",
-        ]
-    )
+    if not os.path.exists("/etc/nginx/nginx.conf"):
+        return
 
-    run(
-        [
-            "/usr/bin/systemctl",
-            "reload",
-            "nginx",
-        ]
-    )
+    if not run(["/usr/sbin/nginx", "-t"]):
+        return
+
+    run(["/usr/bin/systemctl", "reload", "nginx"])
 
 
 def remove_expired_ips(conn):
@@ -123,48 +121,69 @@ def remove_expired_ips(conn):
     ).fetchall()
 
     for row in rows:
+        for ip in (row["ip4"], row["ip6"]):
+            nft_delete_ip(ip)
 
-        for ip in (
-            row["ip4"],
-            row["ip6"],
-        ):
 
+def refresh_active_ips(conn):
+    now = now_utc()
+
+    rows = conn.execute(
+        """
+        SELECT ip4, ip6, expires_at
+        FROM users
+        WHERE disabled = 0
+          AND expires_at > ?
+        """,
+        (now.isoformat(),),
+    ).fetchall()
+
+    for row in rows:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        seconds = int((expires_at - now).total_seconds())
+
+        if seconds <= 0:
+            continue
+
+        for ip in (row["ip4"], row["ip6"]):
             if not valid_ip(ip):
                 continue
 
-            family = (
-                "dns6"
-                if ":" in ip
-                else "dns4"
-            )
+            family = "dns6" if ":" in ip else "dns4"
 
             run(
                 [
                     "/usr/sbin/nft",
-                    "delete",
+                    "add",
                     "element",
                     "inet",
                     "dnsaccess",
                     family,
                     "{",
                     ip,
+                    "timeout",
+                    f"{seconds}s",
                     "}",
                 ]
             )
 
 
 def main():
-
     if not os.path.exists(DB_FILE):
         return
 
     conn = get_db()
 
-    remove_expired_ips(conn)
-
-    rebuild_nginx_allowlist(conn)
-
-    conn.close()
+    try:
+        remove_expired_ips(conn)
+        refresh_active_ips(conn)
+        rebuild_nginx_allowlist(conn)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
