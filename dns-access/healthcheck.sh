@@ -24,43 +24,34 @@ echo " DNS Access Health Check"
 echo "========================================"
 echo
 
-check "dns-access service" \
-    systemctl is-active --quiet dns-access.service
+check "dns-access service" systemctl is-active --quiet dns-access.service
+check "dns-admin service" systemctl is-active --quiet dns-admin.service
+check "unbound service" systemctl is-active --quiet unbound.service
+check "AdGuard Home service" systemctl is-active --quiet AdGuardHome.service
+check "nginx service" systemctl is-active --quiet nginx.service
+check "nftables service" systemctl is-active --quiet nftables.service
 
-check "dns-admin service" \
-    systemctl is-active --quiet dns-admin.service
+check "DNS IPv4 port 53" bash -c 'ss -lunpt 2>/dev/null | grep -Eq "0\.0\.0\.0:53[[:space:]]|127\.0\.0\.1:53[[:space:]]"'
 
-check "unbound service" \
-    systemctl is-active --quiet unbound.service
+check "DNS over HTTPS port 443" bash -c 'ss -lntp 2>/dev/null | grep -Eq "0\.0\.0\.0:443[[:space:]]|\[::\]:443[[:space:]]"'
 
-check "AdGuard Home service" \
-    systemctl is-active --quiet AdGuardHome.service
+check "Unbound port 5353" bash -c 'ss -lunpt 2>/dev/null | grep -Eq "127\.0\.0\.1:5353[[:space:]]"'
 
-check "nginx service" \
-    systemctl is-active --quiet nginx.service
+check "DNS Access port 8787" bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8787[[:space:]]"'
 
-check "nftables service" \
-    systemctl is-active --quiet nftables.service
+check "Admin port 8790" bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8790[[:space:]]"'
 
-check "DNS port 53" \
-    ss -lunpt \
-        | grep -Eq '(:53[[:space:]]|:53$)'
+if [[ -f /etc/dns-access/nftables.conf ]]; then
+    check "nftables configuration" /usr/sbin/nft -c -f /etc/dns-access/nftables.conf
+fi
 
-check "DNS over HTTPS port 443" \
-    ss -lntp \
-        | grep -Eq '(:443[[:space:]]|:443$)'
+if [[ -f /etc/nginx/nginx.conf ]]; then
+    check "nginx configuration" /usr/sbin/nginx -t
+fi
 
-check "Unbound port 5353" \
-    ss -lunpt \
-        | grep -Eq '127\.0\.0\.1:5353'
-
-check "DNS Access port 8787" \
-    ss -lntp \
-        | grep -Eq '127\.0\.0\.1:8787'
-
-check "Admin port 8790" \
-    ss -lntp \
-        | grep -Eq '127\.0\.0\.1:8790'
+if [[ -f /etc/unbound/unbound.conf ]]; then
+    check "Unbound configuration" /usr/sbin/unbound-checkconf /etc/unbound/unbound.conf
+fi
 
 echo
 echo "========================================"
