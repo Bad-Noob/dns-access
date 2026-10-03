@@ -1,0 +1,13 @@
+[Unit]
+Description=DNS Access Firewall Rules
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/dns-access/nftables.conf
+ExecReload=/usr/sbin/nft -f /etc/dns-access/nftables.conf
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
