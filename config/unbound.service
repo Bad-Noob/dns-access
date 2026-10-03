@@ -10,11 +10,12 @@ Group=unbound
 ExecStart=/usr/sbin/unbound -d -c /etc/unbound/unbound.conf
 Restart=on-failure
 RestartSec=5
-
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
 ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/unbound /var/lib/unbound
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
