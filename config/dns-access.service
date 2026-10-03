@@ -7,10 +7,16 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
+
 WorkingDirectory=/opt/dns-access
+
 ExecStart=/opt/dns-access/venv/bin/python /opt/dns-access/app/app.py
+
 Restart=always
 RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
