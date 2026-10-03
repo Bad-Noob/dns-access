@@ -5,9 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=unbound
+Group=unbound
 ExecStart=/usr/sbin/unbound -d -c /etc/unbound/unbound.conf
 Restart=on-failure
 RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
