@@ -1,0 +1,21 @@
+[Unit]
+Description=DNS Access Admin Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/dns-admin
+ExecStart=/opt/dns-admin/venv/bin/python /opt/dns-admin/app/app.py
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
