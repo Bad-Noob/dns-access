@@ -1,2 +1,2 @@
-Flask
-cryptography
+Flask>=3.0,<4
+cryptography>=43,<47
