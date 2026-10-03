@@ -1,0 +1,16 @@
+[Unit]
+Description=DNS Access Service
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/dns-access
+ExecStart=/opt/dns-access/venv/bin/python /opt/dns-access/app/app.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
