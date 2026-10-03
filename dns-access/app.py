@@ -1,58 +1,19 @@
 #!/usr/bin/env python3
 
 import hashlib
-import html
 import ipaddress
 import os
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
-
-CONFIG_FILE = "/etc/dns-access.conf"
 DB_FILE = "/opt/dns-access/data/users.db"
-
 NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
-NGINX_BIN = "/usr/sbin/nginx"
 
-HOST = "127.0.0.1"
-PORT = 8787
-
-
-def load_config():
-    config = {}
-
-    if not os.path.exists(CONFIG_FILE):
-        return config
-
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-
-            if (
-                not line
-                or line.startswith("#")
-                or "=" not in line
-            ):
-                continue
-
-            key, value = line.split("=", 1)
-
-            config[key.strip()] = (
-                value.strip()
-                .strip('"')
-                .strip("'")
-            )
-
-    return config
-
-
-CONFIG = load_config()
-
-DOMAIN = CONFIG.get("DOMAIN", "")
-SERVER_IP = CONFIG.get("SERVER_IP", "")
+HOST = os.getenv("DNS_ACCESS_HOST", "127.0.0.1")
+PORT = int(os.getenv("DNS_ACCESS_PORT", "8787"))
 
 
 def now_utc():
@@ -60,13 +21,9 @@ def now_utc():
 
 
 def get_db():
-    os.makedirs(
-        os.path.dirname(DB_FILE),
-        exist_ok=True,
-    )
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
 
     conn = sqlite3.connect(DB_FILE)
-
     conn.row_factory = sqlite3.Row
 
     conn.execute(
@@ -80,33 +37,24 @@ def get_db():
             ip6 TEXT,
             disabled INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
-            updated_at TEXT,
+            updated_at TEXT NOT NULL,
             link_enc TEXT
         )
         """
     )
 
-    columns = {
-        row["name"]
-        for row in conn.execute(
-            "PRAGMA table_info(users)"
-        ).fetchall()
-    }
-
-    if "link_enc" not in columns:
-        conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN link_enc TEXT
-            """
-        )
-
     conn.commit()
-
     return conn
 
 
-def validate_ip(value):
+def hash_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def valid_ip(value):
+    if not value:
+        return False
+
     try:
         ipaddress.ip_address(value)
         return True
@@ -114,66 +62,86 @@ def validate_ip(value):
         return False
 
 
-def run_command(command):
+def client_ip(handler):
+    forwarded = handler.headers.get("X-Real-IP", "").strip()
+
+    if valid_ip(forwarded):
+        return forwarded
+
+    forwarded_for = handler.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+
+    if valid_ip(forwarded_for):
+        return forwarded_for
+
+    return handler.client_address[0]
+
+
+def nft_timeout_seconds(expires_at):
+    try:
+        expires = datetime.fromisoformat(expires_at)
+
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+
+        seconds = int((expires - now_utc()).total_seconds())
+
+        if seconds <= 0:
+            return 0
+
+        return seconds
+
+    except ValueError:
+        return 0
+
+
+def nft_run(args):
     try:
         subprocess.run(
-            command,
+            ["/usr/sbin/nft", *args],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-
         return True
-
     except Exception:
         return False
 
 
-def nft_add_ip(ip, seconds):
-    if not validate_ip(ip):
+def nft_add_ip(ip, expires_at):
+    if not valid_ip(ip):
         return False
 
-    family = (
-        "dns6"
-        if ":" in ip
-        else "dns4"
-    )
+    timeout = nft_timeout_seconds(expires_at)
 
-    timeout = max(
-        1,
-        int(seconds),
-    )
+    if timeout <= 0:
+        return False
 
-    return run_command(
-        [
-            "nft",
-            "add",
-            "element",
-            "inet",
-            "dnsaccess",
-            family,
-            "{",
-            f"{ip}",
-            "timeout",
-            f"{timeout}s",
-            "}",
-        ]
-    )
+    family = "dns6" if ":" in ip else "dns4"
+
+    command = [
+        "add",
+        "element",
+        "inet",
+        "dnsaccess",
+        family,
+        "{",
+        ip,
+        "timeout",
+        f"{timeout}s",
+        "}",
+    ]
+
+    return nft_run(command)
 
 
 def nft_delete_ip(ip):
-    if not validate_ip(ip):
+    if not valid_ip(ip):
         return False
 
-    family = (
-        "dns6"
-        if ":" in ip
-        else "dns4"
-    )
+    family = "dns6" if ":" in ip else "dns4"
 
-    return run_command(
+    return nft_run(
         [
-            "nft",
             "delete",
             "element",
             "inet",
@@ -186,22 +154,7 @@ def nft_delete_ip(ip):
     )
 
 
-def reload_nginx():
-    if not os.path.exists(NGINX_BIN):
-        return False
-
-    return run_command(
-        [
-            NGINX_BIN,
-            "-s",
-            "reload",
-        ]
-    )
-
-
-def rebuild_nginx_allowlist():
-    conn = get_db()
-
+def rebuild_nginx_allowlist(conn):
     rows = conn.execute(
         """
         SELECT ip4, ip6
@@ -209,850 +162,277 @@ def rebuild_nginx_allowlist():
         WHERE disabled = 0
           AND expires_at > ?
         """,
-        (
-            now_utc().isoformat(),
-        ),
+        (now_utc().isoformat(),),
     ).fetchall()
-
-    conn.close()
 
     ips = set()
 
     for row in rows:
-
-        if row["ip4"]:
+        if valid_ip(row["ip4"]):
             ips.add(row["ip4"])
 
-        if row["ip6"]:
+        if valid_ip(row["ip6"]):
             ips.add(row["ip6"])
 
-    lines = []
+    lines = [f"allow {ip};" for ip in sorted(ips)]
+    lines.append("deny all;")
 
-    for ip in sorted(ips):
+    os.makedirs(os.path.dirname(NGINX_ALLOW_FILE), exist_ok=True)
 
-        if validate_ip(ip):
-            lines.append(
-                f"allow {ip};"
-            )
+    temp_file = NGINX_ALLOW_FILE + ".tmp"
 
-    lines.append(
-        "deny all;"
-    )
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+        handle.write("\n")
 
-    os.makedirs(
-        os.path.dirname(
-            NGINX_ALLOW_FILE
-        ),
-        exist_ok=True,
-    )
+    os.replace(temp_file, NGINX_ALLOW_FILE)
 
-    temp_file = (
-        NGINX_ALLOW_FILE
-        + ".tmp"
-    )
-
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        f.write(
-            "\n".join(lines)
-        )
-
-        f.write("\n")
-
-    os.replace(
-        temp_file,
-        NGINX_ALLOW_FILE,
-    )
-
-    reload_nginx()
-
-
-def parse_expiry(value):
     try:
-
-        expires = datetime.fromisoformat(
-            value.replace(
-                "Z",
-                "+00:00",
-            )
+        subprocess.run(
+            ["/usr/sbin/nginx", "-t"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
 
-        if expires.tzinfo is None:
-            expires = expires.replace(
-                tzinfo=timezone.utc
-            )
-
-        return expires
-
-    except ValueError:
-        return None
-
-
-def register_ip(
-    user_id,
-    client_ip,
-):
-    if not validate_ip(client_ip):
-        return False
-
-    conn = get_db()
-
-    row = conn.execute(
-        """
-        SELECT
-            expires_at,
-            disabled,
-            ip4,
-            ip6
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,),
-    ).fetchone()
-
-    if not row:
-        conn.close()
-        return False
-
-    if row["disabled"]:
-        conn.close()
-        return False
-
-    expires = parse_expiry(
-        row["expires_at"]
-    )
-
-    if not expires:
-        conn.close()
-        return False
-
-    remaining = int(
-        (
-            expires - now_utc()
-        ).total_seconds()
-    )
-
-    if remaining <= 0:
-        conn.close()
-        return False
-
-    old_ip = None
-
-    if ":" in client_ip:
-
-        old_ip = row["ip6"]
-
-        conn.execute(
-            """
-            UPDATE users
-            SET
-                ip6 = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                client_ip,
-                now_utc().isoformat(),
-                user_id,
-            ),
+        subprocess.run(
+            ["/usr/bin/systemctl", "reload", "nginx"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-
-    else:
-
-        old_ip = row["ip4"]
-
-        conn.execute(
-            """
-            UPDATE users
-            SET
-                ip4 = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                client_ip,
-                now_utc().isoformat(),
-                user_id,
-            ),
-        )
-
-    conn.commit()
-    conn.close()
-
-    if old_ip and old_ip != client_ip:
-        nft_delete_ip(old_ip)
-
-    nft_add_ip(
-        client_ip,
-        remaining,
-    )
-
-    rebuild_nginx_allowlist()
-
-    return True
+    except Exception:
+        pass
 
 
-def page(
-    title,
-    body,
-):
+def html_page(title, message, success=True):
+    status_class = "success" if success else "error"
+
     return f"""<!doctype html>
 <html lang="en">
-
 <head>
-
 <meta charset="utf-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1">
-
-<title>{html.escape(title)}</title>
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
 <style>
-
-:root {{
-    --bg:#f1f5f9;
-    --card:#ffffff;
-    --text:#0f172a;
-    --muted:#64748b;
-    --border:#e2e8f0;
-    --primary:#6366f1;
-    --green:#16a34a;
-    --shadow:0 20px 50px rgba(15,23,42,.10);
-}}
-
-[data-theme="dark"] {{
-    --bg:#0b1120;
-    --card:#111827;
-    --text:#f8fafc;
-    --muted:#94a3b8;
-    --border:#263244;
-    --primary:#818cf8;
-    --green:#4ade80;
-    --shadow:0 20px 55px rgba(0,0,0,.40);
-}}
-
-* {{
-    box-sizing:border-box;
-}}
-
 body {{
-    margin:0;
-    min-height:100vh;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    padding:20px;
-    background:var(--bg);
-    color:var(--text);
-    font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: Arial, sans-serif;
 }}
-
 .card {{
-    width:100%;
-    max-width:520px;
-    background:var(--card);
-    border:1px solid var(--border);
-    border-radius:26px;
-    padding:30px;
-    box-shadow:var(--shadow);
+    width: min(92%, 520px);
+    padding: 32px;
+    border-radius: 18px;
+    background: #1e293b;
+    box-shadow: 0 20px 50px rgba(0,0,0,.35);
+    text-align: center;
 }}
-
-.icon {{
-    width:58px;
-    height:58px;
-    margin:0 auto 18px;
-    display:grid;
-    place-items:center;
-    border-radius:50%;
-    background:rgba(99,102,241,.12);
-    color:var(--primary);
-    font-size:28px;
-    font-weight:800;
-}}
-
 h1 {{
-    margin:0;
-    text-align:center;
-    font-size:25px;
+    margin-top: 0;
 }}
-
-.subtitle {{
-    margin:10px 0 22px;
-    text-align:center;
-    color:var(--muted);
-    line-height:1.6;
+.success {{
+    color: #4ade80;
 }}
-
-.status {{
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    gap:8px;
-    padding:11px;
-    border-radius:12px;
-    background:rgba(22,163,74,.10);
-    color:var(--green);
-    font-weight:700;
-    font-size:13px;
+.error {{
+    color: #f87171;
 }}
-
-.dot {{
-    width:8px;
-    height:8px;
-    border-radius:50%;
-    background:currentColor;
+p {{
+    line-height: 1.7;
 }}
-
-.info {{
-    display:grid;
-    grid-template-columns:1fr 1fr;
-    gap:10px;
-    margin-top:18px;
-}}
-
-.box {{
-    padding:14px;
-    border:1px solid var(--border);
-    border-radius:15px;
-}}
-
-.label {{
-    display:block;
-    margin-bottom:7px;
-    color:var(--muted);
-    font-size:11px;
-    font-weight:700;
-    text-transform:uppercase;
-    letter-spacing:.04em;
-}}
-
-.value {{
-    font-size:14px;
-    font-weight:700;
-    word-break:break-word;
-}}
-
-.dns {{
-    margin-top:18px;
-}}
-
-.dns-item {{
-    padding:14px;
-    margin-top:8px;
-    border:1px solid var(--border);
-    border-radius:15px;
-}}
-
-.dns-value {{
-    font-family:
-        ui-monospace,
-        SFMono-Regular,
-        Menlo,
-        monospace;
-    font-size:13px;
-    font-weight:700;
-    word-break:break-all;
-}}
-
-.note {{
-    margin:18px 0 0;
-    color:var(--muted);
-    font-size:12px;
-    line-height:1.7;
-    text-align:center;
-}}
-
-.footer {{
-    margin-top:22px;
-    text-align:center;
-    color:var(--muted);
-    font-size:11px;
-}}
-
-@media (max-width:520px) {{
-
-    .info {{
-        grid-template-columns:1fr;
-    }}
-
-    .card {{
-        padding:22px;
-    }}
-}}
-
 </style>
-
 </head>
-
 <body>
-
 <div class="card">
-
-{body}
-
+<h1 class="{status_class}">{title}</h1>
+<p>{message}</p>
 </div>
-
-<script>
-
-if (
-    localStorage.getItem("dns-theme")
-    === "dark"
-) {{
-    document.documentElement
-        .setAttribute(
-            "data-theme",
-            "dark"
-        );
-}}
-
-</script>
-
 </body>
-
 </html>
 """
 
 
 class Handler(BaseHTTPRequestHandler):
 
-    def log_message(
-        self,
-        fmt,
-        *args,
-    ):
-        print(
-            "%s - request received"
-            % self.client_address[0]
-        )
+    def log_message(self, format_string, *args):
+        print(format_string % args)
 
-    def send_html(
-        self,
-        status,
-        content,
-    ):
-        data = content.encode(
-            "utf-8"
-        )
+    def send_html(self, status, body):
+        encoded = body.encode("utf-8")
 
         self.send_response(status)
-
-        self.send_header(
-            "Content-Type",
-            "text/html; charset=utf-8",
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(data)),
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-store",
-        )
-
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-
-        self.wfile.write(data)
+        self.wfile.write(encoded)
 
     def do_GET(self):
+        path = self.path.split("?", 1)[0]
 
-        parsed = urlparse(
-            self.path
-        )
-
-        path = parsed.path
-
-        if not path.startswith(
-            "/join/"
-        ):
-
+        if not path.startswith("/join/"):
             self.send_html(
                 404,
-                page(
+                html_page(
                     "Not Found",
-                    """
-                    <div class="icon">!</div>
-
-                    <h1>
-                        Page Not Found
-                    </h1>
-
-                    <p class="subtitle">
-                        The requested page does not exist.
-                    </p>
-                    """,
+                    "The requested page does not exist.",
+                    False,
                 ),
             )
-
             return
 
-        token = path[
-            len("/join/"):
-        ]
+        token = unquote(path[len("/join/"):]).strip()
 
-        if (
-            not token
-            or len(token) < 20
-        ):
-
+        if not token:
             self.send_html(
-                403,
-                page(
+                400,
+                html_page(
                     "Invalid Link",
-                    """
-                    <div class="icon">!</div>
-
-                    <h1>
-                        Invalid Access Link
-                    </h1>
-
-                    <p class="subtitle">
-                        This access link is invalid or incomplete.
-                    </p>
-                    """,
+                    "The access link is invalid.",
+                    False,
                 ),
             )
-
             return
 
-        token_hash = hashlib.sha256(
-            token.encode()
-        ).hexdigest()
+        token_hash = hash_token(token)
+        ip = client_ip(self)
 
         conn = get_db()
 
-        row = conn.execute(
-            """
-            SELECT
-                id,
-                username,
-                expires_at,
-                disabled
-            FROM users
-            WHERE token_hash = ?
-            """,
-            (token_hash,),
-        ).fetchone()
+        try:
+            user = conn.execute(
+                """
+                SELECT *
+                FROM users
+                WHERE token_hash = ?
+                LIMIT 1
+                """,
+                (token_hash,),
+            ).fetchone()
 
-        conn.close()
+            if user is None:
+                self.send_html(
+                    404,
+                    html_page(
+                        "Invalid Link",
+                        "This access link is not valid.",
+                        False,
+                    ),
+                )
+                return
 
-        if not row:
+            if user["disabled"]:
+                self.send_html(
+                    403,
+                    html_page(
+                        "Access Disabled",
+                        "This access link has been disabled.",
+                        False,
+                    ),
+                )
+                return
 
-            self.send_html(
-                403,
-                page(
-                    "Invalid Link",
-                    """
-                    <div class="icon">!</div>
+            expires_at = datetime.fromisoformat(user["expires_at"])
 
-                    <h1>
-                        Invalid Access Link
-                    </h1>
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
 
-                    <p class="subtitle">
-                        This access link is invalid or no longer exists.
-                    </p>
-                    """,
-                ),
-            )
+            if expires_at <= now_utc():
+                self.send_html(
+                    403,
+                    html_page(
+                        "Access Expired",
+                        "This access link has expired.",
+                        False,
+                    ),
+                )
+                return
 
-            return
+            old_ip4 = user["ip4"]
+            old_ip6 = user["ip6"]
 
-        if row["disabled"]:
+            ip4 = old_ip4
+            ip6 = old_ip6
 
-            self.send_html(
-                403,
-                page(
-                    "Access Disabled",
-                    """
-                    <div class="icon">!</div>
+            if ":" in ip:
+                ip6 = ip
+            else:
+                ip4 = ip
 
-                    <h1>
-                        Access Disabled
-                    </h1>
+            if old_ip4 and old_ip4 != ip4:
+                nft_delete_ip(old_ip4)
 
-                    <p class="subtitle">
-                        This account has been disabled.
-                    </p>
-                    """,
-                ),
-            )
+            if old_ip6 and old_ip6 != ip6:
+                nft_delete_ip(old_ip6)
 
-            return
+            if not nft_add_ip(ip, user["expires_at"]):
+                self.send_html(
+                    500,
+                    html_page(
+                        "Access Error",
+                        "The server could not update DNS access.",
+                        False,
+                    ),
+                )
+                return
 
-        expires = parse_expiry(
-            row["expires_at"]
-        )
+            updated_at = now_utc().isoformat()
 
-        if not expires:
-
-            self.send_html(
-                500,
-                page(
-                    "Server Error",
-                    """
-                    <div class="icon">!</div>
-
-                    <h1>
-                        Server Error
-                    </h1>
-
-                    <p class="subtitle">
-                        The account expiry information is invalid.
-                    </p>
-                    """,
-                ),
-            )
-
-            return
-
-        if expires <= now_utc():
-
-            self.send_html(
-                403,
-                page(
-                    "Access Expired",
-                    """
-                    <div class="icon">!</div>
-
-                    <h1>
-                        Access Expired
-                    </h1>
-
-                    <p class="subtitle">
-                        This access link has expired.
-                    </p>
-                    """,
-                ),
-            )
-
-            return
-
-        client_ip = (
-            self.headers.get(
-                "X-Real-IP"
-            )
-            or self.client_address[0]
-        )
-
-        client_ip = client_ip.strip()
-
-        if not register_ip(
-            row["id"],
-            client_ip,
-        ):
-
-            self.send_html(
-                400,
-                page(
-                    "Invalid Address",
-                    """
-                    <div class="icon">!</div>
-
-                    <h1>
-                        Invalid Client Address
-                    </h1>
-
-                    <p class="subtitle">
-                        The client address could not be authorized.
-                    </p>
-                    """,
-                ),
-            )
-
-            return
-
-        username = html.escape(
-            row["username"]
-        )
-
-        ip = html.escape(
-            client_ip
-        )
-
-        remaining_days = max(
-            0,
-            int(
+            conn.execute(
+                """
+                UPDATE users
+                SET ip4 = ?,
+                    ip6 = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
                 (
-                    expires
-                    - now_utc()
-                ).total_seconds()
-                / 86400
-            ),
-        )
+                    ip4,
+                    ip6,
+                    updated_at,
+                    user["id"],
+                ),
+            )
 
-        expires_text = expires.strftime(
-            "%Y-%m-%d"
-        )
+            conn.commit()
 
-        body = f"""
-        <div class="icon">
-            ✓
-        </div>
+            rebuild_nginx_allowlist(conn)
 
-        <h1>
-            DNS Access Activated
-        </h1>
+            self.send_html(
+                200,
+                html_page(
+                    "Access Activated",
+                    f"DNS access has been activated for this connection.<br><br>"
+                    f"Registered IP: <strong>{ip}</strong><br><br>"
+                    f"Expires: <strong>{user['expires_at']}</strong>",
+                    True,
+                ),
+            )
 
-        <p class="subtitle">
-            Your current public IP is now authorized.
-        </p>
-
-        <div class="status">
-            <span class="dot"></span>
-            DNS access is active
-        </div>
-
-        <div class="info">
-
-            <div class="box">
-                <span class="label">
-                    User
-                </span>
-
-                <div class="value">
-                    {username}
-                </div>
-            </div>
-
-            <div class="box">
-                <span class="label">
-                    Current IP
-                </span>
-
-                <div class="value">
-                    {ip}
-                </div>
-            </div>
-
-            <div class="box">
-                <span class="label">
-                    Remaining
-                </span>
-
-                <div class="value">
-                    {remaining_days} days
-                </div>
-            </div>
-
-            <div class="box">
-                <span class="label">
-                    Expires
-                </span>
-
-                <div class="value">
-                    {expires_text}
-                </div>
-            </div>
-
-        </div>
-
-        <div class="dns">
-
-            <div class="label">
-                DNS Configuration
-            </div>
-
-            <div class="dns-item">
-
-                <span class="label">
-                    DNS Server
-                </span>
-
-                <div class="dns-value">
-                    {html.escape(SERVER_IP)}
-                </div>
-
-            </div>
-
-            <div class="dns-item">
-
-                <span class="label">
-                    DNS over HTTPS
-                </span>
-
-                <div class="dns-value">
-                    https://{html.escape(DOMAIN)}/dns-query
-                </div>
-
-            </div>
-
-        </div>
-
-        <p class="note">
-            If your public IP changes,
-            open this same link again
-            to authorize the new IP address.
-        </p>
-
-        <div class="footer">
-            Secure DNS Access
-        </div>
-        """
-
-        self.send_html(
-            200,
-            page(
-                "DNS Access Activated",
-                body,
-            ),
-        )
+        finally:
+            conn.close()
 
 
 def main():
+    conn = get_db()
+    rebuild_nginx_allowlist(conn)
+    conn.close()
 
-    if not DOMAIN:
-        raise RuntimeError(
-            "DOMAIN is missing from configuration."
-        )
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
 
-    os.makedirs(
-        os.path.dirname(
-            NGINX_ALLOW_FILE
-        ),
-        exist_ok=True,
-    )
+    print(f"DNS Access Service listening on {HOST}:{PORT}")
 
-    if not os.path.exists(
-        NGINX_ALLOW_FILE
-    ):
-
-        with open(
-            NGINX_ALLOW_FILE,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            f.write(
-                "deny all;\n"
-            )
-
-    rebuild_nginx_allowlist()
-
-    server = HTTPServer(
-        (HOST, PORT),
-        Handler,
-    )
-
-    print(
-        "DNS access service listening "
-        f"on {HOST}:{PORT}"
-    )
-
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
