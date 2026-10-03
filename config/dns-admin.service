@@ -7,15 +7,20 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
+
 WorkingDirectory=/opt/dns-admin
+
+EnvironmentFile=/etc/dns-admin.env
+
 ExecStart=/opt/dns-admin/venv/bin/python /opt/dns-admin/app/app.py
+
 Restart=always
 RestartSec=3
 
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
 ProtectHome=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
