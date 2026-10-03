@@ -1,0 +1,13 @@
+[Unit]
+Description=Recursive DNS Resolver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/unbound -d -c /etc/unbound/unbound.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
