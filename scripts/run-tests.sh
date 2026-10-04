@@ -5,6 +5,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+echo "[INFO] Checking installer requirements script..."
+
+bash -n "$SCRIPT_DIR/check-requirements.sh"
+
+echo "[OK] Installer requirements script syntax"
+
 echo "========================================"
 echo " DNS Access Project Tests"
 echo "========================================"
