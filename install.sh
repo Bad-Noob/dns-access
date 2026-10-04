@@ -656,9 +656,9 @@ issue_certificate() {
     local resolved_ipv4
 
     resolved_ipv4="$(
-        getent ahostsv4 "$DOMAIN" |
-        awk 'NR==1 {print $1}'
-    )"
+            dig +short A "$DOMAIN" |
+            awk 'NF {print; exit}'
+        )"
 
     if [[ -z "$resolved_ipv4" ]]; then
         die "Domain does not resolve to an IPv4 address: $DOMAIN"
@@ -672,8 +672,8 @@ issue_certificate() {
         local resolved_ipv6
 
         resolved_ipv6="$(
-            getent ahostsv6 "$DOMAIN" |
-            awk 'NR==1 {print $1}'
+            dig +short AAAA "$DOMAIN" |
+            awk 'NF {print; exit}'
         )"
 
         if [[ -z "$resolved_ipv6" ]]; then
