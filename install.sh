@@ -651,11 +651,45 @@ configure_nginx() {
 }
 
 issue_certificate() {
+    log "Checking DNS configuration..."
+
+    local resolved_ipv4
+
+    resolved_ipv4="$(
+        getent ahostsv4 "$DOMAIN" |
+        awk 'NR==1 {print $1}'
+    )"
+
+    if [[ -z "$resolved_ipv4" ]]; then
+        die "Domain does not resolve to an IPv4 address: $DOMAIN"
+    fi
+
+    if [[ "$resolved_ipv4" != "$SERVER_IP" ]]; then
+        die "Domain IPv4 address ($resolved_ipv4) does not match server IPv4 ($SERVER_IP)."
+    fi
+
+    if [[ "$IPV6_ENABLED" == "true" ]]; then
+        local resolved_ipv6
+
+        resolved_ipv6="$(
+            getent ahostsv6 "$DOMAIN" |
+            awk 'NR==1 {print $1}'
+        )"
+
+        if [[ -z "$resolved_ipv6" ]]; then
+            die "IPv6 is enabled, but the domain has no IPv6 record."
+        fi
+
+        if [[ "$resolved_ipv6" != "$SERVER_IPV6" ]]; then
+            die "Domain IPv6 address ($resolved_ipv6) does not match server IPv6 ($SERVER_IPV6)."
+        fi
+    fi
+
+    ok "DNS records match the server."
+
     log "Requesting Let's Encrypt certificate..."
 
     systemctl stop nginx || true
-
-    mkdir -p /var/www/certbot
 
     certbot certonly \
         --standalone \
