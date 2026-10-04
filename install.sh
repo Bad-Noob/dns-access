@@ -646,7 +646,6 @@ configure_nginx() {
             /etc/nginx/conf.d/dns-access.conf
     fi
 
-    nginx -t
 
     ok "Web server configuration prepared."
 }
