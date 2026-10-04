@@ -2,10 +2,9 @@
 Description=Periodic DNS Access Maintenance
 
 [Timer]
-OnBootSec=5min
+OnBootSec=2min
 OnUnitActiveSec=5min
 Persistent=true
-Unit=dns-maintenance.service
 
 [Install]
 WantedBy=timers.target
