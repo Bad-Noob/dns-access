@@ -24,12 +24,23 @@ echo " DNS Access Health Check"
 echo "========================================"
 echo
 
-check "dns-access service" systemctl is-active --quiet dns-access.service
-check "dns-admin service" systemctl is-active --quiet dns-admin.service
-check "unbound service" systemctl is-active --quiet unbound.service
-check "AdGuard Home service" systemctl is-active --quiet AdGuardHome.service
-check "nginx service" systemctl is-active --quiet nginx.service
-check "nftables service" systemctl is-active --quiet nftables.service
+check "dns-access service" \
+    systemctl is-active --quiet dns-access.service
+
+check "dns-admin service" \
+    systemctl is-active --quiet dns-admin.service
+
+check "unbound service" \
+    systemctl is-active --quiet unbound.service
+
+check "AdGuard Home service" \
+    systemctl is-active --quiet AdGuardHome.service
+
+check "nginx service" \
+    systemctl is-active --quiet nginx.service
+
+check "nftables service" \
+    systemctl is-active --quiet nftables.service
 
 check "DNS IPv4 port 53" \
     bash -c 'ss -lunpt 2>/dev/null | grep -Eq "0\.0\.0\.0:53[[:space:]]|127\.0\.0\.1:53[[:space:]]"'
@@ -52,7 +63,7 @@ check "Admin port 8790" \
     bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8790[[:space:]]"'
 
 check "DoH backend port 4443" \
-    bash -c 'ss -lntp 2>/dev/null | grep -Eq "0\.0\.0\.0:4443[[:space:]]|\[::\]:4443[[:space:]]|127\.0\.0\.1:4443[[:space:]]"'
+    bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:4443[[:space:]]"'
 
 if [[ -f /etc/dns-access/nftables.conf ]]; then
     check "nftables configuration" \
