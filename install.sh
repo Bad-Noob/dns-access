@@ -2,47 +2,153 @@
 
 set -euo pipefail
 
-APP_NAME="dns-access"
+REPO_URL="https://github.com/Bad-Noob/dns-access.git"
+RAW_BASE_URL="https://raw.githubusercontent.com/Bad-Noob/dns-access/main"
+
 INSTALL_DIR="/opt/dns-access"
 ADMIN_DIR="/opt/dns-admin"
-CONFIG_FILE="/etc/dns-access.conf"
+CONFIG_DIR="/etc/dns-access"
+TMP_DIR="$(mktemp -d)"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+cleanup() {
+    rm -rf "$TMP_DIR"
 }
 
-success() {
-    echo -e "${GREEN}[OK]${NC} $1"
+trap cleanup EXIT
+
+log() {
+    printf '\n[%s] %s\n' "INFO" "$1"
 }
 
-warning() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+ok() {
+    printf '[OK] %s\n' "$1"
 }
 
 error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf '[ERROR] %s\n' "$1" >&2
+}
+
+die() {
+    error "$1"
     exit 1
+}
+
+require_root() {
+    [[ "${EUID}" -eq 0 ]] || die "Run this installer as root."
+}
+
+check_os() {
+    [[ -f /etc/os-release ]] || die "Cannot detect operating system."
+
+    source /etc/os-release
+
+    [[ "${ID:-}" == "ubuntu" ]] || die "Ubuntu is required."
+
+    ok "Ubuntu detected: ${PRETTY_NAME}"
+}
+
+install_packages() {
+    log "Installing required packages..."
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+
+    apt-get install -y \
+        ca-certificates \
+        curl \
+        wget \
+        git \
+        gnupg \
+        unzip \
+        tar \
+        openssl \
+        python3 \
+        python3-venv \
+        python3-pip \
+        nginx \
+        nftables \
+        certbot \
+        unbound \
+        unbound-anchor \
+        dnsutils \
+        sqlite3 \
+        jq \
+        iproute2 \
+        logrotate
+
+    ok "Required packages installed."
+}
+
+ask_value() {
+    local prompt="$1"
+    local default_value="${2:-}"
+    local value
+
+    if [[ -n "$default_value" ]]; then
+        read -r -p "$prompt [$default_value]: " value
+        value="${value:-$default_value}"
+    else
+        read -r -p "$prompt: " value
+    fi
+
+    printf '%s' "$value"
+}
+
+ask_password() {
+    local prompt="$1"
+    local password
+    local confirm
+
+    while true; do
+        read -r -s -p "$prompt: " password
+        echo
+        read -r -s -p "Confirm password: " confirm
+        echo
+
+        [[ "$password" == "$confirm" ]] || {
+            echo "Passwords do not match."
+            continue
+        }
+
+        [[ "${#password}" -ge 12 ]] || {
+            echo "Password must contain at least 12 characters."
+            continue
+        }
+
+        printf '%s' "$password"
+        return
+    done
 }
 
 validate_ipv4() {
     local ip="$1"
 
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    python3 - "$ip" <<'PY'
+import ipaddress
+import sys
 
-    IFS='.' read -r a b c d <<< "$ip"
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+    raise SystemExit(0 if ip.version == 4 else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
+}
 
-    (( a <= 255 )) || return 1
-    (( b <= 255 )) || return 1
-    (( c <= 255 )) || return 1
-    (( d <= 255 )) || return 1
+validate_ipv6() {
+    local ip="$1"
 
-    return 0
+    python3 - "$ip" <<'PY'
+import ipaddress
+import sys
+
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+    raise SystemExit(0 if ip.version == 6 else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
 }
 
 validate_domain() {
@@ -50,344 +156,630 @@ validate_domain() {
 
     [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
     [[ "$domain" == *.* ]] || return 1
-
-    return 0
 }
 
 validate_email() {
     local email="$1"
 
-    [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+    [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
 }
 
-detect_public_ipv4() {
-    local ip=""
+ask_configuration() {
+    echo
+    echo "========================================"
+    echo " DNS Access Installation"
+    echo "========================================"
+    echo
 
-    if command -v curl >/dev/null 2>&1; then
-        ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-    fi
+    SERVER_IP="$(ask_value "Public IPv4 address")"
 
-    if [[ -z "$ip" ]] && command -v wget >/dev/null 2>&1; then
-        ip="$(wget -4 -qO- --timeout=5 https://api.ipify.org 2>/dev/null || true)"
-    fi
+    while ! validate_ipv4 "$SERVER_IP"; do
+        echo "Invalid IPv4 address."
+        SERVER_IP="$(ask_value "Public IPv4 address")"
+    done
 
-    echo "$ip"
-}
+    DOMAIN="$(ask_value "Domain")"
 
-check_dns_record() {
-    local domain="$1"
-    local expected_ip="$2"
-    local resolved_ip=""
+    while ! validate_domain "$DOMAIN"; do
+        echo "Invalid domain."
+        DOMAIN="$(ask_value "Domain")"
+    done
 
-    if command -v dig >/dev/null 2>&1; then
-        resolved_ip="$(dig +short A "$domain" | head -n1 | tr -d '[:space:]')"
+    LE_EMAIL="$(ask_value "Let's Encrypt email")"
+
+    while ! validate_email "$LE_EMAIL"; do
+        echo "Invalid email address."
+        LE_EMAIL="$(ask_value "Let's Encrypt email")"
+    done
+
+    ADMIN_USER="$(ask_value "Administrator username" "admin")"
+
+    while [[ ! "$ADMIN_USER" =~ ^[a-zA-Z0-9._-]{3,32}$ ]]; do
+        echo "Invalid administrator username."
+        ADMIN_USER="$(ask_value "Administrator username" "admin")"
+    done
+
+    ADMIN_PASSWORD="$(ask_password "Administrator password")"
+
+    echo
+    echo "IPv4 DNS support:"
+    echo "1) Enabled"
+    echo "2) Disabled"
+
+    read -r -p "Choose [1]: " IPV4_CHOICE
+    IPV4_CHOICE="${IPV4_CHOICE:-1}"
+
+    case "$IPV4_CHOICE" in
+        1)
+            IPV4_ENABLED="true"
+            ;;
+        2)
+            IPV4_ENABLED="false"
+            ;;
+        *)
+            die "Invalid IPv4 option."
+            ;;
+    esac
+
+    echo
+    echo "IPv6 DNS support:"
+    echo "1) Enabled"
+    echo "2) Disabled"
+
+    read -r -p "Choose [2]: " IPV6_CHOICE
+    IPV6_CHOICE="${IPV6_CHOICE:-2}"
+
+    case "$IPV6_CHOICE" in
+        1)
+            IPV6_ENABLED="true"
+            ;;
+        2)
+            IPV6_ENABLED="false"
+            ;;
+        *)
+            die "Invalid IPv6 option."
+            ;;
+    esac
+
+    if [[ "$IPV6_ENABLED" == "true" ]]; then
+        SERVER_IPV6="$(ask_value "Public IPv6 address")"
+
+        while ! validate_ipv6 "$SERVER_IPV6"; do
+            echo "Invalid IPv6 address."
+            SERVER_IPV6="$(ask_value "Public IPv6 address")"
+        done
     else
-        resolved_ip="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1 {print $1}')"
+        SERVER_IPV6=""
     fi
 
-    [[ -n "$resolved_ip" ]] || return 1
+    echo
+    echo "DNS upstream mode:"
+    echo "1) Recursive DNS"
+    echo "2) DNS over TLS"
+    echo "3) Plain DNS"
 
-    [[ "$resolved_ip" == "$expected_ip" ]]
+    read -r -p "Choose [1]: " DNS_MODE_CHOICE
+    DNS_MODE_CHOICE="${DNS_MODE_CHOICE:-1}"
+
+    case "$DNS_MODE_CHOICE" in
+        1)
+            DNS_UPSTREAM_MODE="recursive"
+            DNS_UPSTREAM_1=""
+            DNS_UPSTREAM_2=""
+            ;;
+        2)
+            DNS_UPSTREAM_MODE="dot"
+
+            DNS_UPSTREAM_1="$(ask_value "First DNS over TLS upstream" "1.1.1.1@853#cloudflare-dns.com")"
+            DNS_UPSTREAM_2="$(ask_value "Second DNS over TLS upstream" "1.0.0.1@853#cloudflare-dns.com")"
+            ;;
+        3)
+            DNS_UPSTREAM_MODE="plain"
+
+            DNS_UPSTREAM_1="$(ask_value "First DNS upstream" "1.1.1.1")"
+            DNS_UPSTREAM_2="$(ask_value "Second DNS upstream" "9.9.9.9")"
+            ;;
+        *)
+            die "Invalid DNS upstream option."
+            ;;
+    esac
+
+    echo
+    echo "========================================"
+    echo " Configuration Summary"
+    echo "========================================"
+    echo
+    echo "Public IPv4 : $SERVER_IP"
+    echo "Public IPv6 : ${SERVER_IPV6:-disabled}"
+    echo "Domain      : $DOMAIN"
+    echo "LE email    : $LE_EMAIL"
+    echo "Admin user  : $ADMIN_USER"
+    echo "IPv4 DNS    : $IPV4_ENABLED"
+    echo "IPv6 DNS    : $IPV6_ENABLED"
+    echo "DNS mode    : $DNS_UPSTREAM_MODE"
+    echo "Upstream 1  : ${DNS_UPSTREAM_1:-not used}"
+    echo "Upstream 2  : ${DNS_UPSTREAM_2:-not used}"
+    echo
+
+    read -r -p "Continue installation? [y/N]: " CONFIRM
+
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Installation cancelled."
 }
 
-clear
+prepare_directories() {
+    log "Preparing directories..."
 
-echo
-echo "============================================================"
-echo "                    DNS ACCESS INSTALLER"
-echo "============================================================"
-echo
+    mkdir -p \
+        "$INSTALL_DIR/app" \
+        "$INSTALL_DIR/data" \
+        "$ADMIN_DIR/app" \
+        "$CONFIG_DIR/ssl" \
+        /var/log/dns-access \
+        /var/log/dns-admin \
+        /var/www/certbot
 
-if [[ "${EUID}" -ne 0 ]]; then
-    error "Please run this installer as root."
-fi
+    chmod 700 "$INSTALL_DIR"
+    chmod 700 "$INSTALL_DIR/data"
+    chmod 700 "$ADMIN_DIR"
+    chmod 700 "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR/ssl"
 
-if [[ ! -f /etc/os-release ]]; then
-    error "Cannot detect operating system."
-fi
+    chmod 750 /var/log/dns-access
+    chmod 750 /var/log/dns-admin
 
-source /etc/os-release
+    ok "Directories prepared."
+}
 
-if [[ "${ID:-}" != "ubuntu" ]]; then
-    error "This installer currently supports Ubuntu only."
-fi
+download_project() {
+    log "Downloading project files..."
 
-success "Ubuntu detected: ${PRETTY_NAME}"
+    git clone --depth 1 "$REPO_URL" "$TMP_DIR/repository"
 
-if ! command -v apt-get >/dev/null 2>&1; then
-    error "apt-get is not available."
-fi
+    [[ -d "$TMP_DIR/repository/dns-access" ]] || die "Project download is incomplete."
+    [[ -d "$TMP_DIR/repository/dns-admin" ]] || die "Project download is incomplete."
+    [[ -d "$TMP_DIR/repository/config" ]] || die "Project configuration is missing."
 
-echo
-info "Checking internet connectivity..."
+    ok "Project downloaded."
+}
 
-if ! curl -fsS --max-time 8 https://example.com >/dev/null 2>&1; then
-    error "Internet connectivity check failed."
-fi
+install_project_files() {
+    log "Installing project files..."
 
-success "Internet connectivity is available."
+    cp "$TMP_DIR/repository/dns-access/app.py" \
+        "$INSTALL_DIR/app/app.py"
 
-echo
-echo "------------------------------------------------------------"
-echo " Server configuration"
-echo "------------------------------------------------------------"
-echo
+    cp "$TMP_DIR/repository/dns-access/maintenance.py" \
+        "$INSTALL_DIR/app/maintenance.py"
 
-DETECTED_IP="$(detect_public_ipv4)"
+    cp "$TMP_DIR/repository/dns-access/healthcheck.sh" \
+        "$INSTALL_DIR/healthcheck.sh"
 
-if [[ -n "$DETECTED_IP" ]]; then
-    read -r -p "Server public IPv4 [${DETECTED_IP}]: " SERVER_IP
-    SERVER_IP="${SERVER_IP:-$DETECTED_IP}"
-else
-    read -r -p "Server public IPv4: " SERVER_IP
-fi
+    cp "$TMP_DIR/repository/dns-admin/app.py" \
+        "$ADMIN_DIR/app/app.py"
 
-validate_ipv4 "$SERVER_IP" || error "Invalid IPv4 address: $SERVER_IP"
+    chmod 750 "$INSTALL_DIR/healthcheck.sh"
 
-while true; do
-    read -r -p "Domain: " DOMAIN
+    cp "$TMP_DIR/repository/config/nftables.conf" \
+        "$CONFIG_DIR/nftables.conf"
 
-    if validate_domain "$DOMAIN"; then
-        break
-    fi
+    cp "$TMP_DIR/repository/config/dns-access.service" \
+        /etc/systemd/system/dns-access.service
 
-    warning "Invalid domain."
-done
+    cp "$TMP_DIR/repository/config/dns-admin.service" \
+        /etc/systemd/system/dns-admin.service
 
-while true; do
-    read -r -p "Let's Encrypt email: " LE_EMAIL
+    cp "$TMP_DIR/repository/config/dns-maintenance.service" \
+        /etc/systemd/system/dns-maintenance.service
 
-    if validate_email "$LE_EMAIL"; then
-        break
-    fi
+    cp "$TMP_DIR/repository/config/dns-maintenance.timer" \
+        /etc/systemd/system/dns-maintenance.timer
 
-    warning "Invalid email address."
-done
+    cp "$TMP_DIR/repository/config/healthcheck.service" \
+        /etc/systemd/system/healthcheck.service
 
-echo
-echo "------------------------------------------------------------"
-echo " Admin account"
-echo "------------------------------------------------------------"
-echo
+    cp "$TMP_DIR/repository/config/healthcheck.timer" \
+        /etc/systemd/system/healthcheck.timer
 
-read -r -p "Admin username [admin]: " ADMIN_USER
-ADMIN_USER="${ADMIN_USER:-admin}"
+    cp "$TMP_DIR/repository/config/nftables.service" \
+        /etc/systemd/system/nftables.service
 
-if [[ ! "$ADMIN_USER" =~ ^[A-Za-z0-9_.-]{3,32}$ ]]; then
-    error "Invalid admin username."
-fi
+    cp "$TMP_DIR/repository/config/certbot-renew.service" \
+        /etc/systemd/system/certbot-renew.service
 
-while true; do
-    read -r -s -p "Admin password: " ADMIN_PASSWORD
-    echo
+    cp "$TMP_DIR/repository/config/certbot-renew.timer" \
+        /etc/systemd/system/certbot-renew.timer
 
-    if [[ ${#ADMIN_PASSWORD} -lt 8 ]]; then
-        warning "Password must contain at least 8 characters."
-        continue
-    fi
+    cp "$TMP_DIR/repository/config/dns-access-logrotate" \
+        /etc/logrotate.d/dns-access
 
-    read -r -s -p "Confirm admin password: " ADMIN_PASSWORD_CONFIRM
-    echo
+    ok "Project files installed."
+}
 
-    if [[ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]]; then
-        warning "Passwords do not match."
-        continue
-    fi
+create_python_environments() {
+    log "Creating Python environments..."
 
-    break
-done
+    python3 -m venv "$INSTALL_DIR/venv"
+    python3 -m venv "$ADMIN_DIR/venv"
 
-echo
-echo "------------------------------------------------------------"
-echo " Network configuration"
-echo "------------------------------------------------------------"
-echo
+    "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
+    "$ADMIN_DIR/venv/bin/pip" install --upgrade pip
 
-read -r -p "Enable IPv4 DNS? [Y/n]: " ENABLE_IPV4
-ENABLE_IPV4="${ENABLE_IPV4:-Y}"
+    "$INSTALL_DIR/venv/bin/pip" install \
+        -r "$TMP_DIR/repository/dns-access/requirements.txt"
 
-read -r -p "Enable IPv6 DNS? [y/N]: " ENABLE_IPV6
-ENABLE_IPV6="${ENABLE_IPV6:-N}"
+    "$ADMIN_DIR/venv/bin/pip" install \
+        -r "$TMP_DIR/repository/dns-admin/requirements.txt"
 
-if [[ "$ENABLE_IPV4" =~ ^[Yy]$ ]]; then
-    IPV4_ENABLED="true"
-else
-    IPV4_ENABLED="false"
-fi
+    ok "Python environments created."
+}
 
-if [[ "$ENABLE_IPV6" =~ ^[Yy]$ ]]; then
-    IPV6_ENABLED="true"
-else
-    IPV6_ENABLED="false"
-fi
+generate_secrets() {
+    log "Generating secrets..."
 
-echo
-echo "============================================================"
-echo "                 INSTALLATION CONFIGURATION"
-echo "============================================================"
-echo
-echo "Server IPv4       : $SERVER_IP"
-echo "Domain            : $DOMAIN"
-echo "Let's Encrypt     : $LE_EMAIL"
-echo "Admin username    : $ADMIN_USER"
-echo "IPv4 DNS          : $IPV4_ENABLED"
-echo "IPv6 DNS          : $IPV6_ENABLED"
-echo
-echo "============================================================"
-echo
+    FLASK_SECRET="$(openssl rand -hex 32)"
 
-read -r -p "Continue with installation? [Y/n]: " CONFIRM
-CONFIRM="${CONFIRM:-Y}"
+    LINK_ENCRYPTION_KEY="$(
+        "$ADMIN_DIR/venv/bin/python" - <<'PY'
+from cryptography.fernet import Fernet
+print(Fernet.generate_key().decode())
+PY
+    )"
 
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo
-    warning "Installation cancelled."
-    exit 0
-fi
-
-echo
-echo "============================================================"
-echo "                 INSTALLING PACKAGES"
-echo "============================================================"
-echo
-
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update
-
-apt-get install -y \
-    curl \
-    wget \
-    ca-certificates \
-    gnupg \
-    unzip \
-    tar \
-    openssl \
-    python3 \
-    python3-venv \
-    python3-pip \
-    nginx \
-    nftables \
-    certbot \
-    sqlite3 \
-    dnsutils \
-    jq
-
-success "Required packages installed."
-
-echo
-info "Checking domain DNS..."
-
-if check_dns_record "$DOMAIN" "$SERVER_IP"; then
-    success "Domain points to this server."
-else
-    warning "Domain does not currently resolve to $SERVER_IP."
-    warning "Let's Encrypt may fail until the DNS record is correct."
-
-    read -r -p "Continue anyway? [y/N]: " CONTINUE_DNS
-    CONTINUE_DNS="${CONTINUE_DNS:-N}"
-
-    if [[ ! "$CONTINUE_DNS" =~ ^[Yy]$ ]]; then
-        error "Installation stopped. Point the domain to $SERVER_IP and run again."
-    fi
-fi
-
-echo
-info "Checking required ports..."
-
-for port in 80 443 53; do
-    if ss -lntup 2>/dev/null | grep -Eq ":${port}[[:space:]]"; then
-        warning "Port $port is already in use."
-    else
-        success "Port $port is available."
-    fi
-done
-
-echo
-info "Creating application directories..."
-
-mkdir -p "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR/app"
-mkdir -p "$INSTALL_DIR/data"
-
-mkdir -p "$ADMIN_DIR"
-mkdir -p "$ADMIN_DIR/app"
-
-chmod 700 "$INSTALL_DIR"
-chmod 700 "$ADMIN_DIR"
-
-success "Application directories created."
-
-echo
-info "Saving installation configuration..."
-
-cat > "$CONFIG_FILE" <<EOF
-SERVER_IP="$SERVER_IP"
-DOMAIN="$DOMAIN"
-LE_EMAIL="$LE_EMAIL"
-ADMIN_USER="$ADMIN_USER"
-IPV4_ENABLED="$IPV4_ENABLED"
-IPV6_ENABLED="$IPV6_ENABLED"
+    cat > /etc/dns-admin.env <<EOF
+ADMIN_USER=$(printf '%s' "$ADMIN_USER")
+ADMIN_PASSWORD=$(printf '%s' "$ADMIN_PASSWORD")
+FLASK_SECRET=$(printf '%s' "$FLASK_SECRET")
+LINK_ENCRYPTION_KEY=$(printf '%s' "$LINK_ENCRYPTION_KEY")
 EOF
 
-chmod 600 "$CONFIG_FILE"
+    chmod 600 /etc/dns-admin.env
 
-success "Configuration saved to $CONFIG_FILE."
+    ok "Secrets generated."
+}
 
-echo
-info "Creating Python virtual environments..."
+create_environment() {
+    log "Creating runtime environment..."
 
-python3 -m venv "$INSTALL_DIR/venv"
-python3 -m venv "$ADMIN_DIR/venv"
+    cat > /etc/dns-access.conf <<EOF
+SERVER_IP=$SERVER_IP
+DOMAIN=$DOMAIN
+LE_EMAIL=$LE_EMAIL
 
-"$INSTALL_DIR/venv/bin/pip" install --upgrade pip
-"$ADMIN_DIR/venv/bin/pip" install --upgrade pip
+IPV4_ENABLED=$IPV4_ENABLED
+IPV6_ENABLED=$IPV6_ENABLED
 
-success "Python environments created."
+DNS_UPSTREAM_MODE=$DNS_UPSTREAM_MODE
+DNS_UPSTREAM_1=$DNS_UPSTREAM_1
+DNS_UPSTREAM_2=$DNS_UPSTREAM_2
 
-echo
-info "Preparing service directories..."
+DOH_ENABLED=true
+DOT_ENABLED=false
+DOQ_ENABLED=false
 
-mkdir -p /etc/dns-access
-mkdir -p /etc/dns-access/ssl
+DNS_ACCESS_HOST=127.0.0.1
+DNS_ACCESS_PORT=8787
 
-chmod 700 /etc/dns-access
-chmod 700 /etc/dns-access/ssl
+DNS_ADMIN_HOST=127.0.0.1
+DNS_ADMIN_PORT=8790
 
-echo
-echo "============================================================"
-echo "                 BASE INSTALLATION READY"
-echo "============================================================"
-echo
-echo "Domain            : https://$DOMAIN"
-echo "Server IPv4       : $SERVER_IP"
-echo "Admin username    : $ADMIN_USER"
-echo "IPv4 DNS          : $IPV4_ENABLED"
-echo "IPv6 DNS          : $IPV6_ENABLED"
-echo
-echo "Prepared:"
-echo
-echo "  [OK] Ubuntu validation"
-echo "  [OK] Internet check"
-echo "  [OK] Interactive configuration"
-echo "  [OK] Required packages"
-echo "  [OK] Application directories"
-echo "  [OK] Python environments"
-echo "  [OK] Installation configuration"
-echo
-echo "Next installer components:"
-echo
-echo "  - TLS certificate"
-echo "  - Nginx"
-echo "  - Unbound"
-echo "  - AdGuard Home"
-echo "  - nftables"
-echo "  - DNS access service"
-echo "  - Admin panel"
-echo "  - systemd services"
-echo "  - User management commands"
-echo
-echo "============================================================"
-echo
+DNS_RESOLVER_HOST=127.0.0.1
+DNS_RESOLVER_PORT=5353
 
-success "Base installer completed."
+DNS_HTTPS_PORT=4443
+EOF
+
+    chmod 600 /etc/dns-access.conf
+
+    ok "Runtime environment created."
+}
+
+configure_unbound() {
+    log "Configuring DNS resolver..."
+
+    mkdir -p /etc/unbound /var/lib/unbound
+
+    if [[ -f /usr/share/dns/root.hints ]]; then
+        cp /usr/share/dns/root.hints /var/lib/unbound/root.hints
+    else
+        curl -fsSL \
+            https://www.internic.net/domain/named.root \
+            -o /var/lib/unbound/root.hints
+    fi
+
+    unbound-anchor -a /var/lib/unbound/root.key || true
+
+    cp "$TMP_DIR/repository/config/unbound.conf" \
+        /etc/unbound/unbound.conf
+
+    case "$DNS_UPSTREAM_MODE" in
+        recursive)
+            rm -f /etc/unbound/unbound-forwarders.conf
+            ;;
+        dot)
+            sed \
+                -e "s|__DNS_UPSTREAM_1__|$DNS_UPSTREAM_1|g" \
+                -e "s|__DNS_UPSTREAM_2__|$DNS_UPSTREAM_2|g" \
+                "$TMP_DIR/repository/config/unbound-forwarders.conf" \
+                > /etc/unbound/unbound-forwarders.conf
+
+            cat >> /etc/unbound/unbound.conf <<'EOF'
+
+include: "/etc/unbound/unbound-forwarders.conf"
+EOF
+            ;;
+        plain)
+            sed \
+                -e "s|__DNS_UPSTREAM_1__|$DNS_UPSTREAM_1|g" \
+                -e "s|__DNS_UPSTREAM_2__|$DNS_UPSTREAM_2|g" \
+                "$TMP_DIR/repository/config/unbound-forwarders-direct.conf" \
+                > /etc/unbound/unbound-forwarders.conf
+
+            cat >> /etc/unbound/unbound.conf <<'EOF'
+
+include: "/etc/unbound/unbound-forwarders.conf"
+EOF
+            ;;
+    esac
+
+    chown -R unbound:unbound /var/lib/unbound
+    chmod 640 /etc/unbound/unbound.conf
+
+    unbound-checkconf /etc/unbound/unbound.conf
+
+    ok "DNS resolver configured."
+}
+
+download_adguard() {
+    log "Installing DNS filtering service..."
+
+    local arch
+    local release_json
+    local download_url
+
+    arch="$(uname -m)"
+
+    case "$arch" in
+        x86_64)
+            arch="amd64"
+            ;;
+        aarch64)
+            arch="arm64"
+            ;;
+        armv7l)
+            arch="armv7"
+            ;;
+        armv6l)
+            arch="armv6"
+            ;;
+        i386|i686)
+            arch="386"
+            ;;
+        *)
+            die "Unsupported CPU architecture: $arch"
+            ;;
+    esac
+
+    release_json="$(
+        curl -fsSL \
+            https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest
+    )"
+
+    download_url="$(
+        printf '%s' "$release_json" |
+        jq -r --arg arch "$arch" '
+            .assets[]
+            | select(.name | test("AdGuardHome_linux_" + $arch + "_.*\\.tar\\.gz$"))
+            | .browser_download_url
+        ' |
+        head -n 1
+    )"
+
+    [[ -n "$download_url" && "$download_url" != "null" ]] ||
+        die "Could not find a compatible release."
+
+    mkdir -p /opt/AdGuardHome
+
+    curl -fsSL "$download_url" -o "$TMP_DIR/adguard.tar.gz"
+
+    tar -xzf "$TMP_DIR/adguard.tar.gz" \
+        -C "$TMP_DIR"
+
+    local extracted
+    extracted="$(find "$TMP_DIR" -maxdepth 1 -type d -name 'AdGuardHome*' | head -n 1)"
+
+    [[ -n "$extracted" ]] || die "AdGuardHome archive extraction failed."
+
+    cp "$extracted/AdGuardHome" \
+        /opt/AdGuardHome/AdGuardHome
+
+    chmod 755 /opt/AdGuardHome/AdGuardHome
+
+    ok "DNS filtering service installed."
+}
+
+configure_adguard() {
+    log "Configuring DNS filtering service..."
+
+    mkdir -p /opt/AdGuardHome
+
+    local certificate="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    local private_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+    sed \
+        -e "s|__DOMAIN__|$DOMAIN|g" \
+        -e "s|__SSL_CERT__|$certificate|g" \
+        -e "s|__SSL_KEY__|$private_key|g" \
+        "$TMP_DIR/repository/config/AdGuardHome.yaml" \
+        > /opt/AdGuardHome/AdGuardHome.yaml
+
+    cp "$TMP_DIR/repository/config/AdGuardHome.service" \
+        /etc/systemd/system/AdGuardHome.service
+
+    ok "DNS filtering configuration prepared."
+}
+
+configure_nginx() {
+    log "Configuring web server..."
+
+    mkdir -p /etc/nginx
+
+    local certificate="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    local private_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+    cp "$TMP_DIR/repository/config/dns-access-security.conf" \
+        /etc/nginx/dns-access-security.conf
+
+    printf 'deny all;\n' > /etc/nginx/dns-allow.conf
+
+    sed \
+        -e "s|__DOMAIN__|$DOMAIN|g" \
+        -e "s|__SSL_CERT__|$certificate|g" \
+        -e "s|__SSL_KEY__|$private_key|g" \
+        "$TMP_DIR/repository/config/nginx.conf" \
+        > /etc/nginx/conf.d/dns-access.conf
+
+    if [[ "$IPV6_ENABLED" != "true" ]]; then
+        sed -i '/listen \[::\]:80;/d' \
+            /etc/nginx/conf.d/dns-access.conf
+
+        sed -i '/listen \[::\]:443 ssl;/d' \
+            /etc/nginx/conf.d/dns-access.conf
+    fi
+
+    nginx -t
+
+    ok "Web server configuration prepared."
+}
+
+issue_certificate() {
+    log "Requesting Let's Encrypt certificate..."
+
+    systemctl stop nginx || true
+
+    mkdir -p /var/www/certbot
+
+    certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$LE_EMAIL" \
+        --domain "$DOMAIN"
+
+    ok "TLS certificate obtained."
+}
+
+configure_nftables() {
+    log "Configuring firewall rules..."
+
+    cp "$TMP_DIR/repository/config/nftables.conf" \
+        /etc/dns-access/nftables.conf
+
+    nft -c -f /etc/dns-access/nftables.conf
+
+    ok "Firewall configuration validated."
+}
+
+enable_services() {
+    log "Enabling services..."
+
+    systemctl daemon-reload
+
+    systemctl enable nftables.service
+    systemctl enable unbound.service
+    systemctl enable AdGuardHome.service
+    systemctl enable nginx.service
+    systemctl enable dns-access.service
+    systemctl enable dns-admin.service
+    systemctl enable dns-maintenance.timer
+    systemctl enable healthcheck.timer
+    systemctl enable certbot-renew.timer
+
+    ok "Services enabled."
+}
+
+start_services() {
+    log "Starting services..."
+
+    systemctl restart nftables.service
+
+    systemctl restart unbound.service
+
+    systemctl restart AdGuardHome.service
+
+    nginx -t
+    systemctl restart nginx.service
+
+    systemctl restart dns-access.service
+    systemctl restart dns-admin.service
+
+    systemctl start dns-maintenance.timer
+    systemctl start healthcheck.timer
+    systemctl start certbot-renew.timer
+
+    ok "Services started."
+}
+
+run_initial_maintenance() {
+    log "Running initial maintenance..."
+
+    systemctl start dns-maintenance.service || true
+
+    ok "Initial maintenance completed."
+}
+
+run_healthcheck() {
+    log "Running health check..."
+
+    "$INSTALL_DIR/healthcheck.sh"
+
+    ok "Health check completed."
+}
+
+show_result() {
+    echo
+    echo "========================================"
+    echo " Installation completed"
+    echo "========================================"
+    echo
+    echo "Admin panel:"
+    echo "https://$DOMAIN/admin/"
+    echo
+    echo "Access link endpoint:"
+    echo "https://$DOMAIN/join/<token>"
+    echo
+    echo "DNS over HTTPS:"
+    echo "https://$DOMAIN/dns-query"
+    echo
+    echo "Administrator username:"
+    echo "$ADMIN_USER"
+    echo
+    echo "The administrator password is the password entered during installation."
+    echo
+}
+
+main() {
+    require_root
+    check_os
+    ask_configuration
+    install_packages
+    prepare_directories
+    download_project
+    install_project_files
+    create_python_environments
+    generate_secrets
+    create_environment
+    configure_unbound
+    download_adguard
+    configure_adguard
+    configure_nftables
+    configure_nginx
+    issue_certificate
+    configure_nginx
+    enable_services
+    start_services
+    run_initial_maintenance
+    run_healthcheck
+    show_result
+}
+
+main "$@"
