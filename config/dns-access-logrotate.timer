@@ -1,5 +1,5 @@
 [Unit]
-Description=Scheduled DNS Access log rotation
+Description=Periodic DNS Access Log Rotation
 
 [Timer]
 OnCalendar=daily
