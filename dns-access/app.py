@@ -409,8 +409,8 @@ class Handler(BaseHTTPRequestHandler):
                 html_page(
                     "Access Activated",
                     f"DNS access has been activated for this connection.<br><br>"
-                    f"Registered IP: <strong>{ip}</strong><br><br>"
-                    f"Expires: <strong>{user['expires_at']}</strong>",
+                    f"Registered IP: <strong>{escape(ip)}</strong><br><br>"
+                    f"Expires: <strong>{escape(user['expires_at'])}</strong>",
                     True,
                 ),
             )
