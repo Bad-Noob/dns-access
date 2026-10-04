@@ -39,6 +39,8 @@ tls:
   certificate_path: __SSL_CERT__
   private_key_path: __SSL_KEY__
 
+  strict_sni_check: false
+
 querylog:
   enabled: true
 
