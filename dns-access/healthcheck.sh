@@ -31,26 +31,42 @@ check "AdGuard Home service" systemctl is-active --quiet AdGuardHome.service
 check "nginx service" systemctl is-active --quiet nginx.service
 check "nftables service" systemctl is-active --quiet nftables.service
 
-check "DNS IPv4 port 53" bash -c 'ss -lunpt 2>/dev/null | grep -Eq "0\.0\.0\.0:53[[:space:]]|127\.0\.0\.1:53[[:space:]]"'
+check "DNS IPv4 port 53" \
+    bash -c 'ss -lunpt 2>/dev/null | grep -Eq "0\.0\.0\.0:53[[:space:]]|127\.0\.0\.1:53[[:space:]]"'
 
-check "DNS over HTTPS port 443" bash -c 'ss -lntp 2>/dev/null | grep -Eq "0\.0\.0\.0:443[[:space:]]|\[::\]:443[[:space:]]"'
+if [[ "${IPV6_ENABLED:-false}" == "true" ]]; then
+    check "DNS IPv6 port 53" \
+        bash -c 'ss -lunpt 2>/dev/null | grep -Eq "\[::\]:53[[:space:]]"'
+fi
 
-check "Unbound port 5353" bash -c 'ss -lunpt 2>/dev/null | grep -Eq "127\.0\.0\.1:5353[[:space:]]"'
+check "HTTPS port 443" \
+    bash -c 'ss -lntp 2>/dev/null | grep -Eq "0\.0\.0\.0:443[[:space:]]|\[::\]:443[[:space:]]"'
 
-check "DNS Access port 8787" bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8787[[:space:]]"'
+check "Unbound port 5353" \
+    bash -c 'ss -lunpt 2>/dev/null | grep -Eq "127\.0\.0\.1:5353[[:space:]]"'
 
-check "Admin port 8790" bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8790[[:space:]]"'
+check "DNS Access port 8787" \
+    bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8787[[:space:]]"'
+
+check "Admin port 8790" \
+    bash -c 'ss -lntp 2>/dev/null | grep -Eq "127\.0\.0\.1:8790[[:space:]]"'
+
+check "DoH backend port 4443" \
+    bash -c 'ss -lntp 2>/dev/null | grep -Eq "0\.0\.0\.0:4443[[:space:]]|\[::\]:4443[[:space:]]|127\.0\.0\.1:4443[[:space:]]"'
 
 if [[ -f /etc/dns-access/nftables.conf ]]; then
-    check "nftables configuration" /usr/sbin/nft -c -f /etc/dns-access/nftables.conf
+    check "nftables configuration" \
+        /usr/sbin/nft -c -f /etc/dns-access/nftables.conf
 fi
 
 if [[ -f /etc/nginx/nginx.conf ]]; then
-    check "nginx configuration" /usr/sbin/nginx -t
+    check "nginx configuration" \
+        /usr/sbin/nginx -t
 fi
 
 if [[ -f /etc/unbound/unbound.conf ]]; then
-    check "Unbound configuration" /usr/sbin/unbound-checkconf /etc/unbound/unbound.conf
+    check "Unbound configuration" \
+        /usr/sbin/unbound-checkconf /etc/unbound/unbound.conf
 fi
 
 echo
