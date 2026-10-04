@@ -1,12 +1,15 @@
 [Unit]
-Description=DNS Access Firewall Rules
+Description=DNS Access Firewall
 After=network-pre.target
 Before=network.target
 
 [Service]
 Type=oneshot
+
 ExecStart=/bin/sh -c '/usr/sbin/nft delete table inet dnsaccess 2>/dev/null || true; /usr/sbin/nft -f /etc/dns-access/nftables.conf'
+
 ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet dnsaccess 2>/dev/null || true; /usr/sbin/nft -f /etc/dns-access/nftables.conf'
+
 RemainAfterExit=yes
 
 [Install]
