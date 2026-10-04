@@ -368,8 +368,8 @@ install_project_files() {
     cp "$TMP_DIR/repository/config/dns-admin.service" \
         /etc/systemd/system/dns-admin.service
 
-    cp "$TMP_DIR/repository/config/dns-maintenance.service" \
-        /etc/systemd/system/dns-maintenance.service
+    cp "$TMP_DIR/repository/config/unbound.service" \
+        /etc/systemd/system/unbound.service
 
     cp "$TMP_DIR/repository/config/dns-maintenance.timer" \
         /etc/systemd/system/dns-maintenance.timer
