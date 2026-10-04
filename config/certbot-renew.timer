@@ -1,10 +1,10 @@
 [Unit]
-Description=Automatic TLS certificate renewal
+Description=Periodic TLS Certificate Renewal
 
 [Timer]
-OnCalendar=*-*-* 03:15:00
-RandomizedDelaySec=30m
+OnCalendar=daily
 Persistent=true
+RandomizedDelaySec=1h
 
 [Install]
 WantedBy=timers.target
