@@ -31,6 +31,10 @@ if not FLASK_SECRET:
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
 fernet = Fernet(LINK_ENCRYPTION_KEY) if LINK_ENCRYPTION_KEY else None
 
 
