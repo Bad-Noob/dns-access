@@ -1,14 +1,21 @@
 [Unit]
 Description=DNS Access Health Check
-After=network-online.target dns-access.service dns-admin.service unbound.service AdGuardHome.service nginx.service nftables.service
+
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
+
 User=root
 Group=root
+
 ExecStart=/opt/dns-access/healthcheck.sh
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
