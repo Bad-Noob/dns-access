@@ -753,7 +753,7 @@ start_services() {
 run_initial_maintenance() {
     log "Running initial maintenance..."
 
-    systemctl start dns-maintenance.service || true
+    systemctl start dns-maintenance.service
 
     ok "Initial maintenance completed."
 }
