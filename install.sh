@@ -612,6 +612,14 @@ configure_adguard() {
         "$TMP_DIR/repository/config/AdGuardHome.yaml" \
         > /opt/AdGuardHome/AdGuardHome.yaml
 
+    if [[ "$IPV6_ENABLED" != "true" ]]; then
+        sed -i '/^[[:space:]]*- ::1$/d' \
+            /opt/AdGuardHome/AdGuardHome.yaml
+
+        sed -i '/^[[:space:]]*- ::$/d' \
+            /opt/AdGuardHome/AdGuardHome.yaml
+    fi
+
     cp "$TMP_DIR/repository/config/AdGuardHome.service" \
         /etc/systemd/system/AdGuardHome.service
 
