@@ -734,9 +734,7 @@ start_services() {
     log "Starting services..."
 
     systemctl restart nftables.service
-
     systemctl restart unbound.service
-
     systemctl restart AdGuardHome.service
 
     nginx -t
