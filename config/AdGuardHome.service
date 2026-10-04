@@ -1,5 +1,5 @@
 [Unit]
-Description=DNS Filtering and HTTPS Service
+Description=DNS Filtering Service
 After=network-online.target unbound.service
 Wants=network-online.target
 Requires=unbound.service
@@ -8,18 +8,26 @@ Requires=unbound.service
 Type=simple
 User=root
 Group=root
+
 WorkingDirectory=/opt/AdGuardHome
+
 ExecStart=/opt/AdGuardHome/AdGuardHome \
     -c /opt/AdGuardHome/AdGuardHome.yaml \
     -w /opt/AdGuardHome
+
 Restart=on-failure
 RestartSec=5
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
+
 ReadWritePaths=/opt/AdGuardHome
+
 LimitNOFILE=65535
+
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
