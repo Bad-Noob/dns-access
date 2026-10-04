@@ -2,10 +2,9 @@
 Description=Periodic DNS Access Health Check
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=15min
+OnBootSec=3min
+OnUnitActiveSec=10min
 Persistent=true
-Unit=healthcheck.service
 
 [Install]
 WantedBy=timers.target
