@@ -656,9 +656,9 @@ issue_certificate() {
     local resolved_ipv4
 
     resolved_ipv4="$(
-            dig +short A "$DOMAIN" |
-            awk 'NF {print; exit}'
-        )"
+        dig +short A "$DOMAIN" |
+        awk 'NF {print; exit}'
+    )"
 
     if [[ -z "$resolved_ipv4" ]]; then
         die "Domain does not resolve to an IPv4 address: $DOMAIN"
