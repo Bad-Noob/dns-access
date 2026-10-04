@@ -27,21 +27,28 @@ fi
 
 ok "Ubuntu detected: ${PRETTY_NAME}"
 
-for command in \
-    apt-get \
-    curl \
-    wget \
-    python3 \
-    systemctl \
-    nft \
-    nginx \
-    openssl \
+REQUIRED_COMMANDS=(
+    apt-get
+    curl
+    wget
+    git
+    python3
+    openssl
     sqlite3
-do
+    systemctl
+    nft
+    nginx
+    unbound-checkconf
+)
+
+FAILED=0
+
+for command in "${REQUIRED_COMMANDS[@]}"; do
     if command -v "$command" >/dev/null 2>&1; then
         ok "$command"
     else
-        echo "[WARN] Missing command: $command"
+        echo "[MISSING] $command"
+        FAILED=$((FAILED + 1))
     fi
 done
 
@@ -53,5 +60,12 @@ if [[ ! -d /sys ]]; then
     fail "/sys is not available."
 fi
 
+if [[ "$FAILED" -gt 0 ]]; then
+    echo
+    echo "[ERROR] Missing $FAILED required command(s)."
+    echo "Run the installer first to install the required packages."
+    exit 1
+fi
+
 echo
-echo "Requirement check completed."
+echo "[OK] All required system commands are available."
