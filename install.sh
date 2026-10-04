@@ -760,6 +760,7 @@ main() {
     require_root
     check_os
     ask_configuration
+
     install_packages
     prepare_directories
     download_project
@@ -767,17 +768,29 @@ main() {
     create_python_environments
     generate_secrets
     create_environment
+
     configure_unbound
     download_adguard
     configure_adguard
+
     configure_nftables
+
+    systemctl daemon-reload
+    systemctl enable nftables.service
+    systemctl restart nftables.service
+
     configure_nginx
+
     issue_certificate
-    configure_nginx
+
+    nginx -t
+
     enable_services
     start_services
+
     run_initial_maintenance
     run_healthcheck
+
     show_result
 }
 
