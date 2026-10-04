@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
+from html import escape
 
 DB_FILE = "/opt/dns-access/data/users.db"
 NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
