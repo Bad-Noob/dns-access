@@ -11,9 +11,7 @@ from urllib.parse import unquote
 from html import escape
 
 DB_FILE = "/opt/dns-access/data/users.db"
-NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
-
-HOST = os.getenv("DNS_ACCESS_HOST", "127.0.0.1")
+HOST = os.getenv("DNS_ACCESS_HOST", "0.0.0.0")
 PORT = int(os.getenv("DNS_ACCESS_PORT", "8787"))
 
 
@@ -64,16 +62,6 @@ def valid_ip(value):
 
 
 def client_ip(handler):
-    forwarded = handler.headers.get("X-Real-IP", "").strip()
-
-    if valid_ip(forwarded):
-        return forwarded
-
-    forwarded_for = handler.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-
-    if valid_ip(forwarded_for):
-        return forwarded_for
-
     return handler.client_address[0]
 
 
@@ -153,57 +141,6 @@ def nft_delete_ip(ip):
             "}",
         ]
     )
-
-
-def rebuild_nginx_allowlist(conn):
-    rows = conn.execute(
-        """
-        SELECT ip4, ip6
-        FROM users
-        WHERE disabled = 0
-          AND expires_at > ?
-        """,
-        (now_utc().isoformat(),),
-    ).fetchall()
-
-    ips = set()
-
-    for row in rows:
-        if valid_ip(row["ip4"]):
-            ips.add(row["ip4"])
-
-        if valid_ip(row["ip6"]):
-            ips.add(row["ip6"])
-
-    lines = [f"allow {ip};" for ip in sorted(ips)]
-    lines.append("deny all;")
-
-    os.makedirs(os.path.dirname(NGINX_ALLOW_FILE), exist_ok=True)
-
-    temp_file = NGINX_ALLOW_FILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-        handle.write("\n")
-
-    os.replace(temp_file, NGINX_ALLOW_FILE)
-
-    try:
-        subprocess.run(
-            ["/usr/sbin/nginx", "-t"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        subprocess.run(
-            ["/usr/bin/systemctl", "reload", "nginx"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
 
 
 def html_page(title, message, success=True):
@@ -402,7 +339,6 @@ class Handler(BaseHTTPRequestHandler):
 
             conn.commit()
 
-            rebuild_nginx_allowlist(conn)
 
             self.send_html(
                 200,
@@ -420,10 +356,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    conn = get_db()
-    rebuild_nginx_allowlist(conn)
-    conn.close()
-
     server = ThreadingHTTPServer((HOST, PORT), Handler)
 
     print(f"DNS Access Service listening on {HOST}:{PORT}")

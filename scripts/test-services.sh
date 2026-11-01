@@ -6,7 +6,6 @@ SERVICES=(
     "nftables.service"
     "unbound.service"
     "AdGuardHome.service"
-    "nginx.service"
     "dns-access.service"
     "dns-admin.service"
 )

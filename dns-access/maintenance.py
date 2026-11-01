@@ -7,8 +7,6 @@ import subprocess
 from datetime import datetime, timezone
 
 DB_FILE = "/opt/dns-access/data/users.db"
-NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
-
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -63,48 +61,6 @@ def nft_delete_ip(ip):
             "}",
         ]
     )
-
-
-def rebuild_nginx_allowlist(conn):
-    rows = conn.execute(
-        """
-        SELECT ip4, ip6
-        FROM users
-        WHERE disabled = 0
-          AND expires_at > ?
-        """,
-        (now_utc().isoformat(),),
-    ).fetchall()
-
-    ips = set()
-
-    for row in rows:
-        if valid_ip(row["ip4"]):
-            ips.add(row["ip4"])
-
-        if valid_ip(row["ip6"]):
-            ips.add(row["ip6"])
-
-    lines = [f"allow {ip};" for ip in sorted(ips)]
-    lines.append("deny all;")
-
-    os.makedirs(os.path.dirname(NGINX_ALLOW_FILE), exist_ok=True)
-
-    temp_file = NGINX_ALLOW_FILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-        handle.write("\n")
-
-    os.replace(temp_file, NGINX_ALLOW_FILE)
-
-    if not os.path.exists("/etc/nginx/nginx.conf"):
-        return
-
-    if not run(["/usr/sbin/nginx", "-t"]):
-        return
-
-    run(["/usr/bin/systemctl", "reload", "nginx"])
 
 
 def remove_expired_ips(conn):
@@ -181,7 +137,6 @@ def main():
     try:
         remove_expired_ips(conn)
         refresh_active_ips(conn)
-        rebuild_nginx_allowlist(conn)
     finally:
         conn.close()
 

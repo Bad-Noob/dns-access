@@ -71,16 +71,7 @@ echo "[5/8] Checking version..."
 echo "[OK] Version"
 
 echo
-echo "[6/8] Testing nginx configuration..."
-
-if [[ "${EUID}" -eq 0 && -x /usr/sbin/nginx && -f /etc/nginx/nginx.conf ]]; then
-    "$SCRIPT_DIR/test-nginx.sh"
-else
-    echo "[SKIP] nginx runtime configuration is not available."
-fi
-
-echo
-echo "[7/8] Testing Unbound configuration..."
+echo "[6/7] Testing Unbound configuration..."
 
 if [[ "${EUID}" -eq 0 && -x /usr/sbin/unbound-checkconf && -f /etc/unbound/unbound.conf ]]; then
     "$SCRIPT_DIR/test-unbound.sh"
@@ -89,7 +80,7 @@ else
 fi
 
 echo
-echo "[8/8] Testing nftables configuration..."
+echo "[7/7] Testing nftables configuration..."
 
 if [[ "${EUID}" -eq 0 && -x /usr/sbin/nft && -f /etc/dns-access/nftables.conf ]]; then
     "$SCRIPT_DIR/test-nftables.sh"

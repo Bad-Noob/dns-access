@@ -1,29 +1,26 @@
-.PHONY: check health syntax tests nginx unbound nftables services version
+.PHONY: check health syntax tests unbound nftables services version
 
 check:
-	python3 -m py_compile app.py maintenance.py
+python3 -m py_compile app.py maintenance.py
 
 health:
-	./healthcheck.sh
+./healthcheck.sh
 
 syntax:
-	bash -n ../install.sh
-	bash -n ../scripts/*.sh
+bash -n ../install.sh
+bash -n ../scripts/*.sh
 
 tests:
-	../scripts/run-tests.sh
-
-nginx:
-	../scripts/test-nginx.sh
+../scripts/run-tests.sh
 
 unbound:
-	../scripts/test-unbound.sh
+../scripts/test-unbound.sh
 
 nftables:
-	../scripts/test-nftables.sh
+../scripts/test-nftables.sh
 
 services:
-	../scripts/test-services.sh
+../scripts/test-services.sh
 
 version:
-	../scripts/version.sh
+../scripts/version.sh

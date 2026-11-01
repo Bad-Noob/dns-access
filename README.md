@@ -11,13 +11,9 @@ A self-hosted DNS access management system for Ubuntu servers.
 - Automatic public IP registration
 - Automatic IP replacement when a user reconnects
 - DNS access restricted by authorized IP addresses
-- DNS over HTTPS
 - Recursive DNS resolution
-- Optional DNS over TLS upstreams
-- Optional plain DNS upstreams
 - DNS caching
 - DNS filtering
-- Let's Encrypt TLS certificates
 - Web-based administrator panel
 - SQLite database
 - User expiration
@@ -34,8 +30,6 @@ A self-hosted DNS access management system for Ubuntu servers.
 - Ubuntu
 - Root access
 - Public IPv4 address
-- A domain pointing to the server
-- A valid email address for Let's Encrypt
 - IPv6 is optional
 
 ## Installation
@@ -47,14 +41,10 @@ Run:
 The installer interactively asks for:
 
 - Public IPv4 address
-- Domain name
-- Let's Encrypt email
 - Administrator username
 - Administrator password
 - IPv4 support
 - IPv6 support
-- DNS upstream mode
-- DNS upstream addresses when required
 
 The installer then:
 
@@ -66,32 +56,20 @@ The installer then:
 6. Configures the DNS resolver.
 7. Installs the DNS filtering service.
 8. Configures nftables.
-9. Obtains a Let's Encrypt certificate.
-10. Configures Nginx.
-11. Starts the required services.
-12. Runs health checks.
+9. Configures the DNS access and administrator services.
+10. Starts the required services.
+11. Runs health checks.
 
-## DNS Modes
+## DNS Resolution
 
-The installer supports three resolver modes.
-
-### Recursive
-
-The server performs recursive DNS resolution directly.
-
-### DNS over TLS
-
-The resolver forwards DNS queries to configured TLS upstream servers.
-
-### Plain DNS
-
-The resolver forwards DNS queries to configured DNS servers without TLS.
+Unbound performs recursive DNS resolution directly. No external DNS
+forwarders or upstream mode selection are configured.
 
 ## Access Links
 
 Each user receives a unique access link:
 
-    https://example.com/join/<token>
+    http://SERVER-IP:8787/join/<token>
 
 When the user opens the link:
 
@@ -109,17 +87,13 @@ Normal DNS service uses port 53.
 
 DNS access is protected by nftables and only authorized client addresses are permitted.
 
-DNS over HTTPS is available through:
-
-    https://example.com/dns-query
-
-The internal HTTPS DNS service is not intended to be exposed directly to the Internet.
+DNS over HTTPS is not provided. DNS clients connect directly to the server using DNS on port 53.
 
 ## Administrator Panel
 
 The administrator panel is available at:
 
-    https://example.com/admin/
+    http://SERVER-IP:8790/admin/
 
 The panel provides:
 
@@ -179,7 +153,6 @@ Generated passwords, keys, and certificates are stored outside the repository.
     │   ├── check-requirements.sh
     │   ├── generate-secrets.sh
     │   ├── check-dns.sh
-    │   ├── test-nginx.sh
     │   ├── test-unbound.sh
     │   ├── test-nftables.sh
     │   ├── test-services.sh
@@ -190,26 +163,19 @@ Generated passwords, keys, and certificates are stored outside the repository.
     └── config/
         ├── AdGuardHome.service
         ├── AdGuardHome.yaml
-        ├── certbot-renew.service
-        ├── certbot-renew.timer
         ├── dns-access.conf
         ├── dns-access.env
         ├── dns-access.service
-        ├── dns-access-security.conf
         ├── dns-admin.env
         ├── dns-admin.service
-        ├── dns-allow.conf
         ├── dns-maintenance.service
         ├── dns-maintenance.timer
         ├── healthcheck.service
         ├── healthcheck.timer
-        ├── nginx.conf
         ├── nftables.conf
         ├── nftables.service
         ├── tmpfiles.conf
         ├── unbound.conf
-        ├── unbound-forwarders.conf
-        ├── unbound-forwarders-direct.conf
         └── unbound.service
 
 ## License

@@ -1,6 +1,6 @@
 [Unit]
 Description=DNS Access Service
-After=network-online.target nftables.service nginx.service
+After=network-online.target nftables.service
 Wants=network-online.target
 Requires=nftables.service
 
@@ -25,7 +25,6 @@ ProtectHome=true
 ProtectSystem=full
 
 ReadWritePaths=/opt/dns-access
-ReadWritePaths=/etc/nginx
 
 LimitNOFILE=65535
 

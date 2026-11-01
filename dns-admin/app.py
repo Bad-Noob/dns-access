@@ -15,10 +15,10 @@ from flask import Flask, redirect, render_template_string, request, session, url
 
 
 DB_FILE = "/opt/dns-access/data/users.db"
-NGINX_ALLOW_FILE = "/etc/nginx/dns-allow.conf"
-
-HOST = os.getenv("DNS_ADMIN_HOST", "127.0.0.1")
+HOST = os.getenv("DNS_ADMIN_HOST", "0.0.0.0")
 PORT = int(os.getenv("DNS_ADMIN_PORT", "8790"))
+SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
+SERVER_URL_HOST = f"[{SERVER_IP}]" if ":" in SERVER_IP else SERVER_IP
 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 _password_b64 = os.getenv("ADMIN_PASSWORD_B64", "")
@@ -37,7 +37,7 @@ if not FLASK_SECRET:
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 
-app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_SECURE"] = False
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
@@ -95,60 +95,6 @@ def nft_delete_ip(ip):
         return True
     except Exception:
         return False
-
-
-def rebuild_nginx_allowlist(conn):
-    rows = conn.execute(
-        """
-        SELECT ip4, ip6
-        FROM users
-        WHERE disabled = 0
-          AND expires_at > ?
-        """,
-        (now_utc().isoformat(),),
-    ).fetchall()
-
-    ips = set()
-
-    for row in rows:
-        if valid_ip(row["ip4"]):
-            ips.add(row["ip4"])
-
-        if valid_ip(row["ip6"]):
-            ips.add(row["ip6"])
-
-    lines = [f"allow {ip};" for ip in sorted(ips)]
-    lines.append("deny all;")
-
-    os.makedirs(os.path.dirname(NGINX_ALLOW_FILE), exist_ok=True)
-
-    temp_file = NGINX_ALLOW_FILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-        handle.write("\n")
-
-    os.replace(temp_file, NGINX_ALLOW_FILE)
-
-    if not os.path.exists("/etc/nginx/nginx.conf"):
-        return
-
-    try:
-        subprocess.run(
-            ["/usr/sbin/nginx", "-t"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        subprocess.run(
-            ["/usr/bin/systemctl", "reload", "nginx"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
 
 
 def remove_user_ips(row):
@@ -625,8 +571,7 @@ def show_new_link():
     if not token:
         return redirect(url_for("dashboard"))
 
-    domain = request.host.split(":")[0]
-    link = f"https://{domain}/join/{token}"
+    link = f"http://{SERVER_URL_HOST}:8787/join/{token}"
 
     return render_template_string(
         f"""
@@ -674,8 +619,7 @@ def show_link(user_id):
     except Exception:
         return redirect(url_for("dashboard"))
 
-    domain = request.host.split(":")[0]
-    full_link = f"https://{domain}{link}"
+    full_link = f"http://{SERVER_URL_HOST}:8787{link}"
 
     return render_template_string(
         f"""
@@ -774,7 +718,6 @@ def toggle_user(user_id):
         if new_disabled:
             remove_user_ips(row)
 
-        rebuild_nginx_allowlist(conn)
 
     conn.close()
 
@@ -801,7 +744,6 @@ def delete_user(user_id):
 
         conn.commit()
 
-        rebuild_nginx_allowlist(conn)
 
     conn.close()
 
