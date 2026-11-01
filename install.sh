@@ -3,6 +3,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/Bad-Noob/dns-access.git"
+ADGUARD_VERSION="v0.107.79"
 RAW_BASE_URL="https://raw.githubusercontent.com/Bad-Noob/dns-access/main"
 
 INSTALL_DIR="/opt/dns-access"
@@ -35,6 +36,10 @@ die() {
 
 require_root() {
     [[ "${EUID}" -eq 0 ]] || die "Run this installer as root."
+}
+
+require_tty() {
+    [[ -r /dev/tty && -w /dev/tty ]] || die "Interactive terminal required. Run this installer from an interactive shell."
 }
 
 check_os() {
@@ -86,10 +91,10 @@ ask_value() {
     local value
 
     if [[ -n "$default_value" ]]; then
-        read -r -p "$prompt [$default_value]: " value
+        read -r -p "$prompt [$default_value]: " value </dev/tty
         value="${value:-$default_value}"
     else
-        read -r -p "$prompt: " value
+        read -r -p "$prompt: " value </dev/tty
     fi
 
     printf '%s' "$value"
@@ -101,10 +106,10 @@ ask_password() {
     local confirm
 
     while true; do
-        read -r -s -p "$prompt: " password
+        read -r -s -p "$prompt: " password </dev/tty
         printf '\n' >&2
 
-        read -r -s -p "Confirm password: " confirm
+        read -r -s -p "Confirm password: " confirm </dev/tty
         printf '\n' >&2
 
         if [[ "$password" != "$confirm" ]]; then
@@ -206,7 +211,7 @@ ask_configuration() {
     echo "1) Enabled"
     echo "2) Disabled"
 
-    read -r -p "Choose [1]: " IPV4_CHOICE
+    read -r -p "Choose [1]: " IPV4_CHOICE </dev/tty
     IPV4_CHOICE="${IPV4_CHOICE:-1}"
 
     case "$IPV4_CHOICE" in
@@ -226,7 +231,7 @@ ask_configuration() {
     echo "1) Enabled"
     echo "2) Disabled"
 
-    read -r -p "Choose [2]: " IPV6_CHOICE
+    read -r -p "Choose [2]: " IPV6_CHOICE </dev/tty
     IPV6_CHOICE="${IPV6_CHOICE:-2}"
 
     case "$IPV6_CHOICE" in
@@ -258,7 +263,7 @@ ask_configuration() {
     echo "2) DNS over TLS"
     echo "3) Plain DNS"
 
-    read -r -p "Choose [1]: " DNS_MODE_CHOICE
+    read -r -p "Choose [1]: " DNS_MODE_CHOICE </dev/tty
     DNS_MODE_CHOICE="${DNS_MODE_CHOICE:-1}"
 
     case "$DNS_MODE_CHOICE" in
@@ -301,7 +306,7 @@ ask_configuration() {
     echo "Upstream 2  : ${DNS_UPSTREAM_2:-not used}"
     echo
 
-    read -r -p "Continue installation? [y/N]: " CONFIRM
+    read -r -p "Continue installation? [y/N]: " CONFIRM </dev/tty
 
     [[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Installation cancelled."
 }
@@ -525,7 +530,14 @@ EOF
     esac
 
     chown -R unbound:unbound /var/lib/unbound
+
+    chown root:unbound /etc/unbound/unbound.conf
     chmod 640 /etc/unbound/unbound.conf
+
+    if [[ -f /etc/unbound/unbound-forwarders.conf ]]; then
+        chown root:unbound /etc/unbound/unbound-forwarders.conf
+        chmod 640 /etc/unbound/unbound-forwarders.conf
+    fi
 
     mkdir -p /run/unbound
     chown unbound:unbound /run/unbound
@@ -539,7 +551,6 @@ download_adguard() {
     log "Installing DNS filtering service..."
 
     local arch
-    local release_json
     local download_url
 
     arch="$(uname -m)"
@@ -565,20 +576,7 @@ download_adguard() {
             ;;
     esac
 
-    release_json="$(
-        curl -fsSL \
-            https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest
-    )"
-
-    download_url="$(
-        printf '%s' "$release_json" |
-        jq -r --arg arch "$arch" '
-            .assets[]
-            | select((.name | startswith("AdGuardHome_linux_" + $arch + ".")) and (.name | endswith(".tar.gz")))
-            | .browser_download_url
-        ' |
-        head -n 1
-    )"
+    download_url="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VERSION}/AdGuardHome_linux_${arch}.tar.gz"
 
     [[ -n "$download_url" && "$download_url" != "null" ]] ||
         die "Could not find a compatible release."
@@ -626,6 +624,14 @@ configure_adguard() {
         sed -i '/^[[:space:]]*- "__SERVER_IPV6__"$/d' \
             /opt/AdGuardHome/AdGuardHome.yaml
     fi
+
+    # AdGuard Home v0.107.79 uses configuration schema version 34.
+    printf '\nschema_version: 34\n' >> /opt/AdGuardHome/AdGuardHome.yaml
+
+    /opt/AdGuardHome/AdGuardHome \
+        --check-config \
+        -c /opt/AdGuardHome/AdGuardHome.yaml \
+        -w /opt/AdGuardHome || die "AdGuard Home configuration validation failed."
 
     cp "$TMP_DIR/repository/config/AdGuardHome.service" \
         /etc/systemd/system/AdGuardHome.service
@@ -776,7 +782,9 @@ run_initial_maintenance() {
 run_healthcheck() {
     log "Running health check..."
 
-    "$INSTALL_DIR/healthcheck.sh"
+    if ! "$INSTALL_DIR/healthcheck.sh"; then
+        die "Health check failed. Review the failed checks above before using this server."
+    fi
 
     ok "Health check completed."
 }
@@ -805,6 +813,7 @@ show_result() {
 
 main() {
     require_root
+    require_tty
     check_os
     ask_configuration
 
