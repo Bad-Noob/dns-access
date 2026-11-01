@@ -371,6 +371,9 @@ install_project_files() {
     cp "$TMP_DIR/repository/config/unbound.service" \
         /etc/systemd/system/unbound.service
 
+    cp "$TMP_DIR/repository/config/dns-maintenance.service" \
+        /etc/systemd/system/dns-maintenance.service
+
     cp "$TMP_DIR/repository/config/dns-maintenance.timer" \
         /etc/systemd/system/dns-maintenance.timer
 
@@ -524,6 +527,9 @@ EOF
     chown -R unbound:unbound /var/lib/unbound
     chmod 640 /etc/unbound/unbound.conf
 
+    mkdir -p /run/unbound
+    chown unbound:unbound /run/unbound
+
     unbound-checkconf /etc/unbound/unbound.conf
 
     ok "DNS resolver configured."
@@ -568,7 +574,7 @@ download_adguard() {
         printf '%s' "$release_json" |
         jq -r --arg arch "$arch" '
             .assets[]
-            | select(.name | test("AdGuardHome_linux_" + $arch + "_.*\\.tar\\.gz$"))
+            | select((.name | startswith("AdGuardHome_linux_" + $arch + ".")) and (.name | endswith(".tar.gz")))
             | .browser_download_url
         ' |
         head -n 1
@@ -613,11 +619,11 @@ configure_adguard() {
         "$TMP_DIR/repository/config/AdGuardHome.yaml" \
         > /opt/AdGuardHome/AdGuardHome.yaml
 
-    if [[ "$IPV6_ENABLED" != "true" ]]; then
-        sed -i '/^[[:space:]]*- ::1$/d' \
+    if [[ "$IPV6_ENABLED" == "true" ]]; then
+        sed -i "s|__SERVER_IPV6__|$SERVER_IPV6|g" \
             /opt/AdGuardHome/AdGuardHome.yaml
-
-        sed -i '/^[[:space:]]*- ::$/d' \
+    else
+        sed -i '/^[[:space:]]*- "__SERVER_IPV6__"$/d' \
             /opt/AdGuardHome/AdGuardHome.yaml
     fi
 

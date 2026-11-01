@@ -18,7 +18,11 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 
-ReadOnlyPaths=/etc/unbound /var/lib/unbound
+RuntimeDirectory=unbound
+RuntimeDirectoryMode=0750
+
+ReadOnlyPaths=/etc/unbound
+ReadWritePaths=/var/lib/unbound /run/unbound
 
 LimitNOFILE=65535
 

@@ -7,8 +7,7 @@ dns:
   bind_hosts:
     - 127.0.0.1
     - __SERVER_IP__
-    - ::1
-    - ::
+    - "__SERVER_IPV6__"
 
   port: 53
 
@@ -23,7 +22,7 @@ dns:
   ratelimit: 0
   refuse_any: true
 
-  cache_size: 64mb
+  cache_size: 67108864
   cache_ttl_min: 60
   cache_ttl_max: 86400
 
