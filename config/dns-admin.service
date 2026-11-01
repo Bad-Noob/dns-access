@@ -15,7 +15,7 @@ WorkingDirectory=/opt/dns-admin
 EnvironmentFile=/etc/dns-admin.env
 EnvironmentFile=-/etc/dns-access.conf
 
-ExecStart=/opt/dns-admin/venv/bin/python /opt/dns-admin/app/app.py
+ExecStart=/opt/dns-admin/venv/bin/gunicorn --chdir /opt/dns-admin/app --workers 2 --bind 0.0.0.0:8790 app:app
 
 Restart=always
 RestartSec=3
@@ -26,7 +26,6 @@ ProtectHome=true
 ProtectSystem=full
 
 ReadWritePaths=/opt/dns-access/data
-ReadWritePaths=/etc/nginx
 
 LimitNOFILE=65535
 

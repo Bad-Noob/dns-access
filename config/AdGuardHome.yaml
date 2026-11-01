@@ -26,20 +26,6 @@ dns:
   cache_ttl_min: 60
   cache_ttl_max: 86400
 
-tls:
-  enabled: true
-
-  server_name: __DOMAIN__
-
-  port_https: 4443
-  port_dns_over_tls: 0
-  port_dns_over_quic: 0
-
-  certificate_path: __SSL_CERT__
-  private_key_path: __SSL_KEY__
-
-  strict_sni_check: false
-
 querylog:
   enabled: true
 

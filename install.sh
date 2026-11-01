@@ -71,9 +71,7 @@ install_packages() {
         python3 \
         python3-venv \
         python3-pip \
-        nginx \
         nftables \
-        certbot \
         unbound \
         unbound-anchor \
         dnsutils \
@@ -156,18 +154,7 @@ except ValueError:
 PY
 }
 
-validate_domain() {
-    local domain="$1"
 
-    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
-    [[ "$domain" == *.* ]] || return 1
-}
-
-validate_email() {
-    local email="$1"
-
-    [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
-}
 
 ask_configuration() {
     echo
@@ -181,20 +168,6 @@ ask_configuration() {
     while ! validate_ipv4 "$SERVER_IP"; do
         echo "Invalid IPv4 address."
         SERVER_IP="$(ask_value "Public IPv4 address")"
-    done
-
-    DOMAIN="$(ask_value "Domain")"
-
-    while ! validate_domain "$DOMAIN"; do
-        echo "Invalid domain."
-        DOMAIN="$(ask_value "Domain")"
-    done
-
-    LE_EMAIL="$(ask_value "Let's Encrypt email")"
-
-    while ! validate_email "$LE_EMAIL"; do
-        echo "Invalid email address."
-        LE_EMAIL="$(ask_value "Let's Encrypt email")"
     done
 
     ADMIN_USER="$(ask_value "Administrator username" "admin")"
@@ -257,37 +230,9 @@ ask_configuration() {
         SERVER_IPV6=""
     fi
 
-    echo
-    echo "DNS upstream mode:"
-    echo "1) Recursive DNS"
-    echo "2) DNS over TLS"
-    echo "3) Plain DNS"
-
-    read -r -p "Choose [1]: " DNS_MODE_CHOICE </dev/tty
-    DNS_MODE_CHOICE="${DNS_MODE_CHOICE:-1}"
-
-    case "$DNS_MODE_CHOICE" in
-        1)
-            DNS_UPSTREAM_MODE="recursive"
-            DNS_UPSTREAM_1=""
-            DNS_UPSTREAM_2=""
-            ;;
-        2)
-            DNS_UPSTREAM_MODE="dot"
-
-            DNS_UPSTREAM_1="$(ask_value "First DNS over TLS upstream" "1.1.1.1@853#cloudflare-dns.com")"
-            DNS_UPSTREAM_2="$(ask_value "Second DNS over TLS upstream" "1.0.0.1@853#cloudflare-dns.com")"
-            ;;
-        3)
-            DNS_UPSTREAM_MODE="plain"
-
-            DNS_UPSTREAM_1="$(ask_value "First DNS upstream" "1.1.1.1")"
-            DNS_UPSTREAM_2="$(ask_value "Second DNS upstream" "9.9.9.9")"
-            ;;
-        *)
-            die "Invalid DNS upstream option."
-            ;;
-    esac
+    DNS_UPSTREAM_MODE="recursive"
+    DNS_UPSTREAM_1=""
+    DNS_UPSTREAM_2=""
 
     echo
     echo "========================================"
@@ -296,14 +241,9 @@ ask_configuration() {
     echo
     echo "Public IPv4 : $SERVER_IP"
     echo "Public IPv6 : ${SERVER_IPV6:-disabled}"
-    echo "Domain      : $DOMAIN"
-    echo "LE email    : $LE_EMAIL"
     echo "Admin user  : $ADMIN_USER"
     echo "IPv4 DNS    : $IPV4_ENABLED"
     echo "IPv6 DNS    : $IPV6_ENABLED"
-    echo "DNS mode    : $DNS_UPSTREAM_MODE"
-    echo "Upstream 1  : ${DNS_UPSTREAM_1:-not used}"
-    echo "Upstream 2  : ${DNS_UPSTREAM_2:-not used}"
     echo
 
     read -r -p "Continue installation? [y/N]: " CONFIRM </dev/tty
@@ -318,16 +258,14 @@ prepare_directories() {
         "$INSTALL_DIR/app" \
         "$INSTALL_DIR/data" \
         "$ADMIN_DIR/app" \
-        "$CONFIG_DIR/ssl" \
         /var/log/dns-access \
         /var/log/dns-admin \
-        /var/www/certbot
+        "$CONFIG_DIR"
 
     chmod 700 "$INSTALL_DIR"
     chmod 700 "$INSTALL_DIR/data"
     chmod 700 "$ADMIN_DIR"
     chmod 700 "$CONFIG_DIR"
-    chmod 700 "$CONFIG_DIR/ssl"
 
     chmod 750 /var/log/dns-access
     chmod 750 /var/log/dns-admin
@@ -336,9 +274,18 @@ prepare_directories() {
 }
 
 download_project() {
-    log "Downloading project files..."
+    log "Preparing project files..."
 
-    git clone --depth 1 "$REPO_URL" "$TMP_DIR/repository"
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+    if [[ -d "$SCRIPT_DIR/dns-access" && -d "$SCRIPT_DIR/dns-admin" && -d "$SCRIPT_DIR/config" ]]; then
+        mkdir -p "$TMP_DIR/repository"
+        cp -a "$SCRIPT_DIR/." "$TMP_DIR/repository/"
+        rm -rf "$TMP_DIR/repository/.git"
+        log "Using local project files."
+    else
+        git clone --depth 1 "$REPO_URL" "$TMP_DIR/repository"
+    fi
 
     [[ -d "$TMP_DIR/repository/dns-access" ]] || die "Project download is incomplete."
     [[ -d "$TMP_DIR/repository/dns-admin" ]] || die "Project download is incomplete."
@@ -391,11 +338,7 @@ install_project_files() {
     cp "$TMP_DIR/repository/config/nftables.service" \
         /etc/systemd/system/nftables.service
 
-    cp "$TMP_DIR/repository/config/certbot-renew.service" \
-        /etc/systemd/system/certbot-renew.service
 
-    cp "$TMP_DIR/repository/config/certbot-renew.timer" \
-        /etc/systemd/system/certbot-renew.timer
 
     cp "$TMP_DIR/repository/config/dns-access-logrotate" \
         /etc/logrotate.d/dns-access
@@ -450,30 +393,17 @@ create_environment() {
 
     cat > /etc/dns-access.conf <<EOF
 SERVER_IP=$SERVER_IP
-DOMAIN=$DOMAIN
-LE_EMAIL=$LE_EMAIL
-
 IPV4_ENABLED=$IPV4_ENABLED
 IPV6_ENABLED=$IPV6_ENABLED
 
-DNS_UPSTREAM_MODE=$DNS_UPSTREAM_MODE
-DNS_UPSTREAM_1=$DNS_UPSTREAM_1
-DNS_UPSTREAM_2=$DNS_UPSTREAM_2
-
-DOH_ENABLED=true
-DOT_ENABLED=false
-DOQ_ENABLED=false
-
-DNS_ACCESS_HOST=127.0.0.1
+DNS_ACCESS_HOST=0.0.0.0
 DNS_ACCESS_PORT=8787
 
-DNS_ADMIN_HOST=127.0.0.1
+DNS_ADMIN_HOST=0.0.0.0
 DNS_ADMIN_PORT=8790
 
 DNS_RESOLVER_HOST=127.0.0.1
 DNS_RESOLVER_PORT=5353
-
-DNS_HTTPS_PORT=4443
 EOF
 
     chmod 600 /etc/dns-access.conf
@@ -499,45 +429,12 @@ configure_unbound() {
     cp "$TMP_DIR/repository/config/unbound.conf" \
         /etc/unbound/unbound.conf
 
-    case "$DNS_UPSTREAM_MODE" in
-        recursive)
-            rm -f /etc/unbound/unbound-forwarders.conf
-            ;;
-        dot)
-            sed \
-                -e "s|__DNS_UPSTREAM_1__|$DNS_UPSTREAM_1|g" \
-                -e "s|__DNS_UPSTREAM_2__|$DNS_UPSTREAM_2|g" \
-                "$TMP_DIR/repository/config/unbound-forwarders.conf" \
-                > /etc/unbound/unbound-forwarders.conf
-
-            cat >> /etc/unbound/unbound.conf <<'EOF'
-
-include: "/etc/unbound/unbound-forwarders.conf"
-EOF
-            ;;
-        plain)
-            sed \
-                -e "s|__DNS_UPSTREAM_1__|$DNS_UPSTREAM_1|g" \
-                -e "s|__DNS_UPSTREAM_2__|$DNS_UPSTREAM_2|g" \
-                "$TMP_DIR/repository/config/unbound-forwarders-direct.conf" \
-                > /etc/unbound/unbound-forwarders.conf
-
-            cat >> /etc/unbound/unbound.conf <<'EOF'
-
-include: "/etc/unbound/unbound-forwarders.conf"
-EOF
-            ;;
-    esac
+    rm -f /etc/unbound/unbound-forwarders.conf
 
     chown -R unbound:unbound /var/lib/unbound
 
     chown root:unbound /etc/unbound/unbound.conf
     chmod 640 /etc/unbound/unbound.conf
-
-    if [[ -f /etc/unbound/unbound-forwarders.conf ]]; then
-        chown root:unbound /etc/unbound/unbound-forwarders.conf
-        chmod 640 /etc/unbound/unbound-forwarders.conf
-    fi
 
     mkdir -p /run/unbound
     chown unbound:unbound /run/unbound
@@ -606,14 +503,8 @@ configure_adguard() {
 
     mkdir -p /opt/AdGuardHome
 
-    local certificate="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    local private_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
     sed \
-        -e "s|__DOMAIN__|$DOMAIN|g" \
         -e "s|__SERVER_IP__|$SERVER_IP|g" \
-        -e "s|__SSL_CERT__|$certificate|g" \
-        -e "s|__SSL_KEY__|$private_key|g" \
         "$TMP_DIR/repository/config/AdGuardHome.yaml" \
         > /opt/AdGuardHome/AdGuardHome.yaml
 
@@ -639,89 +530,6 @@ configure_adguard() {
     ok "DNS filtering configuration prepared."
 }
 
-configure_nginx() {
-    log "Configuring web server..."
-
-    mkdir -p /etc/nginx
-
-    local certificate="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    local private_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
-    cp "$TMP_DIR/repository/config/dns-access-security.conf" \
-        /etc/nginx/dns-access-security.conf
-
-    printf 'deny all;\n' > /etc/nginx/dns-allow.conf
-
-    sed \
-        -e "s|__DOMAIN__|$DOMAIN|g" \
-        -e "s|__SSL_CERT__|$certificate|g" \
-        -e "s|__SSL_KEY__|$private_key|g" \
-        "$TMP_DIR/repository/config/nginx.conf" \
-        > /etc/nginx/conf.d/dns-access.conf
-
-    if [[ "$IPV6_ENABLED" != "true" ]]; then
-        sed -i '/listen \[::\]:80;/d' \
-            /etc/nginx/conf.d/dns-access.conf
-
-        sed -i '/listen \[::\]:443 ssl;/d' \
-            /etc/nginx/conf.d/dns-access.conf
-    fi
-
-
-    ok "Web server configuration prepared."
-}
-
-issue_certificate() {
-    log "Checking DNS configuration..."
-
-    local resolved_ipv4
-
-    resolved_ipv4="$(
-        dig +short A "$DOMAIN" |
-        awk 'NF {print; exit}'
-    )"
-
-    if [[ -z "$resolved_ipv4" ]]; then
-        die "Domain does not resolve to an IPv4 address: $DOMAIN"
-    fi
-
-    if [[ "$resolved_ipv4" != "$SERVER_IP" ]]; then
-        die "Domain IPv4 address ($resolved_ipv4) does not match server IPv4 ($SERVER_IP)."
-    fi
-
-    if [[ "$IPV6_ENABLED" == "true" ]]; then
-        local resolved_ipv6
-
-        resolved_ipv6="$(
-            dig +short AAAA "$DOMAIN" |
-            awk 'NF {print; exit}'
-        )"
-
-        if [[ -z "$resolved_ipv6" ]]; then
-            die "IPv6 is enabled, but the domain has no IPv6 record."
-        fi
-
-        if [[ "$resolved_ipv6" != "$SERVER_IPV6" ]]; then
-            die "Domain IPv6 address ($resolved_ipv6) does not match server IPv6 ($SERVER_IPV6)."
-        fi
-    fi
-
-    ok "DNS records match the server."
-
-    log "Requesting Let's Encrypt certificate..."
-
-    systemctl stop nginx || true
-
-    certbot certonly \
-        --standalone \
-        --non-interactive \
-        --agree-tos \
-        --email "$LE_EMAIL" \
-        --domain "$DOMAIN"
-
-    ok "TLS certificate obtained."
-}
-
 configure_nftables() {
     log "Configuring firewall rules..."
 
@@ -741,12 +549,10 @@ enable_services() {
     systemctl enable nftables.service
     systemctl enable unbound.service
     systemctl enable AdGuardHome.service
-    systemctl enable nginx.service
     systemctl enable dns-access.service
     systemctl enable dns-admin.service
     systemctl enable dns-maintenance.timer
     systemctl enable healthcheck.timer
-    systemctl enable certbot-renew.timer
 
     ok "Services enabled."
 }
@@ -758,15 +564,12 @@ start_services() {
     systemctl restart unbound.service
     systemctl restart AdGuardHome.service
 
-    nginx -t
-    systemctl restart nginx.service
 
     systemctl restart dns-access.service
     systemctl restart dns-admin.service
 
     systemctl start dns-maintenance.timer
     systemctl start healthcheck.timer
-    systemctl start certbot-renew.timer
 
     ok "Services started."
 }
@@ -783,8 +586,8 @@ wait_for_app_ports() {
     log "Waiting for application ports..."
 
     for attempt in {1..15}; do
-        if ss -lnt 2>/dev/null | grep -Eq "127\\.0\\.0\\.1:8787[[:space:]]" &&
-           ss -lnt 2>/dev/null | grep -Eq "127\\.0\\.0\\.1:8790[[:space:]]"; then
+        if ss -lnt 2>/dev/null | grep -Eq "0\\.0\\.0\\.0:8787[[:space:]]" &&
+           ss -lnt 2>/dev/null | grep -Eq "0\\.0\\.0\\.0:8790[[:space:]]"; then
             ok "Application ports are ready."
             return 0
         fi
@@ -814,13 +617,13 @@ show_result() {
     echo "========================================"
     echo
     echo "Admin panel:"
-    echo "https://$DOMAIN/admin/"
+    echo "http://$SERVER_IP:8790/admin/"
     echo
     echo "Access link endpoint:"
-    echo "https://$DOMAIN/join/<token>"
+    echo "http://$SERVER_IP:8787/join/<token>"
     echo
-    echo "DNS over HTTPS:"
-    echo "https://$DOMAIN/dns-query"
+    echo "DNS server:"
+    echo "$SERVER_IP:53"
     echo
     echo "Administrator username:"
     echo "$ADMIN_USER"
@@ -853,11 +656,8 @@ main() {
     systemctl enable nftables.service
     systemctl restart nftables.service
 
-    configure_nginx
 
-    issue_certificate
 
-    nginx -t
 
     enable_services
     start_services

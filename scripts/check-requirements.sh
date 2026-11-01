@@ -37,7 +37,6 @@ REQUIRED_COMMANDS=(
     sqlite3
     systemctl
     nft
-    nginx
     unbound-checkconf
 )
 
