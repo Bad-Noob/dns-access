@@ -779,8 +779,26 @@ run_initial_maintenance() {
     ok "Initial maintenance completed."
 }
 
+wait_for_app_ports() {
+    log "Waiting for application ports..."
+
+    for attempt in {1..15}; do
+        if ss -lnt 2>/dev/null | grep -Eq "127\\.0\\.0\\.1:8787[[:space:]]" &&
+           ss -lnt 2>/dev/null | grep -Eq "127\\.0\\.0\\.1:8790[[:space:]]"; then
+            ok "Application ports are ready."
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    log "Application ports are not ready after 30 seconds. Running health check anyway."
+}
+
 run_healthcheck() {
     log "Running health check..."
+
+    wait_for_app_ports
 
     if ! "$INSTALL_DIR/healthcheck.sh"; then
         die "Health check failed. Review the failed checks above before using this server."
