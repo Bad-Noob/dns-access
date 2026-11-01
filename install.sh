@@ -607,6 +607,7 @@ configure_adguard() {
 
     sed \
         -e "s|__DOMAIN__|$DOMAIN|g" \
+        -e "s|__SERVER_IP__|$SERVER_IP|g" \
         -e "s|__SSL_CERT__|$certificate|g" \
         -e "s|__SSL_KEY__|$private_key|g" \
         "$TMP_DIR/repository/config/AdGuardHome.yaml" \

@@ -6,7 +6,7 @@ users: []
 dns:
   bind_hosts:
     - 127.0.0.1
-    - 0.0.0.0
+    - __SERVER_IP__
     - ::1
     - ::
 
