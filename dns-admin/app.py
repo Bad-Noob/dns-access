@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import base64
 import hashlib
 import ipaddress
 import os
@@ -20,7 +21,12 @@ HOST = os.getenv("DNS_ADMIN_HOST", "127.0.0.1")
 PORT = int(os.getenv("DNS_ADMIN_PORT", "8790"))
 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+_password_b64 = os.getenv("ADMIN_PASSWORD_B64", "")
+ADMIN_PASSWORD = (
+    base64.b64decode(_password_b64, validate=True).decode("utf-8")
+    if _password_b64
+    else os.getenv("ADMIN_PASSWORD", "")
+)
 
 FLASK_SECRET = os.getenv("FLASK_SECRET", "")
 LINK_ENCRYPTION_KEY = os.getenv("LINK_ENCRYPTION_KEY", "")

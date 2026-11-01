@@ -102,25 +102,25 @@ ask_password() {
 
     while true; do
         read -r -s -p "$prompt: " password
-        echo
+        printf '\n' >&2
+
         read -r -s -p "Confirm password: " confirm
-        echo
+        printf '\n' >&2
 
-        [[ "$password" == "$confirm" ]] || {
-            echo "Passwords do not match."
+        if [[ "$password" != "$confirm" ]]; then
+            echo "Passwords do not match." >&2
             continue
-        }
+        fi
 
-        [[ "${#password}" -ge 12 ]] || {
-            echo "Password must contain at least 12 characters."
+        if [[ "${#password}" -lt 12 ]]; then
+            echo "Password must contain at least 12 characters." >&2
             continue
-        }
+        fi
 
         printf '%s' "$password"
         return
     done
 }
-
 validate_ipv4() {
     local ip="$1"
 
@@ -427,7 +427,7 @@ PY
 
     cat > /etc/dns-admin.env <<EOF
 ADMIN_USER=$(printf '%s' "$ADMIN_USER")
-ADMIN_PASSWORD=$(printf '%s' "$ADMIN_PASSWORD")
+ADMIN_PASSWORD_B64=$(printf '%s' "$ADMIN_PASSWORD" | base64 -w0)
 FLASK_SECRET=$(printf '%s' "$FLASK_SECRET")
 LINK_ENCRYPTION_KEY=$(printf '%s' "$LINK_ENCRYPTION_KEY")
 EOF
