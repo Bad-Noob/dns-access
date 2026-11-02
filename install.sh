@@ -68,6 +68,7 @@ install_packages() {
         unzip \
         tar \
         openssl \
+        apache2-utils \
         python3 \
         python3-venv \
         python3-pip \
@@ -178,6 +179,24 @@ ask_configuration() {
     done
 
     ADMIN_PASSWORD="$(ask_password "Administrator password")"
+
+    ADGUARD_USER="$(ask_value "AdGuard username" "adguard")"
+
+    while [[ ! "$ADGUARD_USER" =~ ^[a-zA-Z0-9._-]{3,32}$ ]]; do
+        echo "Invalid AdGuard username."
+        ADGUARD_USER="$(ask_value "AdGuard username" "adguard")"
+    done
+
+    while true; do
+        ADGUARD_PASSWORD="$(ask_password "AdGuard password")"
+        ADGUARD_PASSWORD_BYTES="$(printf '%s' "$ADGUARD_PASSWORD" | wc -c)"
+
+        if (( ADGUARD_PASSWORD_BYTES <= 72 )); then
+            break
+        fi
+
+        echo "AdGuard password must not exceed 72 bytes."
+    done
 
     echo
     echo "IPv4 DNS support:"
@@ -516,6 +535,41 @@ configure_adguard() {
             /opt/AdGuardHome/AdGuardHome.yaml
     fi
 
+    local adguard_hash
+
+    adguard_hash="$(printf '%s\n' "$ADGUARD_PASSWORD" | htpasswd -nBi -C 10 "$ADGUARD_USER" | cut -d: -f2)"
+    adguard_hash="${adguard_hash/\$2y\$/\$2a\$}"
+
+    [[ "$adguard_hash" =~ ^\$2a\$ ]] || die "Could not generate a valid AdGuard password hash."
+
+    python3 - "$ADGUARD_USER" "$adguard_hash" /opt/AdGuardHome/AdGuardHome.yaml <<'PYTHON'
+import sys
+from pathlib import Path
+
+username, password_hash, filename = sys.argv[1:]
+path = Path(filename)
+content = path.read_text()
+
+address = "  address: 127.0.0.1:8081"
+users = "users: []"
+
+if content.count(address) != 1:
+    raise SystemExit("Unexpected AdGuard HTTP address configuration.")
+
+if content.count(users) != 1:
+    raise SystemExit("Unexpected AdGuard users configuration.")
+
+content = content.replace(address, "  address: 0.0.0.0:8081")
+content = content.replace(
+    users,
+    f'users:\n  - name: "{username}"\n    password: "{password_hash}"'
+)
+
+path.write_text(content)
+PYTHON
+
+    chmod 600 /opt/AdGuardHome/AdGuardHome.yaml
+
     # AdGuard Home v0.107.79 uses configuration schema version 34.
     printf '\nschema_version: 34\n' >> /opt/AdGuardHome/AdGuardHome.yaml
 
@@ -618,6 +672,12 @@ show_result() {
     echo
     echo "Admin panel:"
     echo "http://$SERVER_IP:8790/admin/"
+    echo
+    echo "AdGuard panel:"
+    echo "http://$SERVER_IP:8081"
+    echo
+    echo "AdGuard username:"
+    echo "$ADGUARD_USER"
     echo
     echo "Access link endpoint:"
     echo "http://$SERVER_IP:8787/join/<token>"
