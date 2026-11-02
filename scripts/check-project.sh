@@ -13,6 +13,7 @@ REQUIRED_FILES=(
 
     "dns-access/app.py"
     "dns-access/maintenance.py"
+    "dns-access/dns-diagnostics.py"
     "dns-access/healthcheck.sh"
     "dns-access/requirements.txt"
     "dns-access/Makefile"

@@ -34,9 +34,15 @@ echo "[3/8] Checking Python syntax..."
 python3 -m py_compile \
     "$ROOT_DIR/dns-access/app.py" \
     "$ROOT_DIR/dns-access/maintenance.py" \
+    "$ROOT_DIR/dns-access/dns-diagnostics.py" \
     "$ROOT_DIR/dns-admin/app.py"
 
 echo "[OK] Python syntax"
+
+echo
+echo "[INFO] Running DNS diagnostics unit tests..."
+python3 -m unittest discover -s "$ROOT_DIR/dns-access/tests" -p "test_*.py" -v
+echo "[OK] DNS diagnostics unit tests"
 
 echo
 echo "[4/8] Checking required Python modules..."

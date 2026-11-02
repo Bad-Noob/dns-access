@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import hmac
 import ipaddress
 import os
 import secrets
@@ -20,19 +21,29 @@ PORT = int(os.getenv("DNS_ADMIN_PORT", "8790"))
 SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
 SERVER_URL_HOST = f"[{SERVER_IP}]" if ":" in SERVER_IP else SERVER_IP
 
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_USER = os.getenv("ADMIN_USER", "").strip()
 _password_b64 = os.getenv("ADMIN_PASSWORD_B64", "")
-ADMIN_PASSWORD = (
-    base64.b64decode(_password_b64, validate=True).decode("utf-8")
-    if _password_b64
-    else os.getenv("ADMIN_PASSWORD", "")
-)
+
+try:
+    ADMIN_PASSWORD = (
+        base64.b64decode(_password_b64, validate=True).decode("utf-8")
+        if _password_b64
+        else os.getenv("ADMIN_PASSWORD", "")
+    )
+except (ValueError, UnicodeDecodeError) as exc:
+    raise RuntimeError("Invalid administrator password configuration.") from exc
 
 FLASK_SECRET = os.getenv("FLASK_SECRET", "")
 LINK_ENCRYPTION_KEY = os.getenv("LINK_ENCRYPTION_KEY", "")
 
-if not FLASK_SECRET:
-    FLASK_SECRET = secrets.token_hex(32)
+if not ADMIN_USER:
+    raise RuntimeError("ADMIN_USER must be configured.")
+
+if not ADMIN_PASSWORD:
+    raise RuntimeError("ADMIN_PASSWORD must be configured.")
+
+if len(FLASK_SECRET) < 32:
+    raise RuntimeError("FLASK_SECRET must contain at least 32 characters.")
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
@@ -40,6 +51,33 @@ app.secret_key = FLASK_SECRET
 app.config["SESSION_COOKIE_SECURE"] = False
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+def get_csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+@app.context_processor
+def inject_csrf_token():
+    return {"csrf_token": get_csrf_token()}
+
+
+@app.before_request
+def validate_csrf_token():
+    if request.method == "POST":
+        expected = session.get("csrf_token")
+        submitted = request.form.get("csrf_token", "")
+
+        if (
+            not isinstance(expected, str)
+            or not submitted
+            or not hmac.compare_digest(expected, submitted)
+        ):
+            return "Invalid CSRF token.", 403
 
 fernet = Fernet(LINK_ENCRYPTION_KEY) if LINK_ENCRYPTION_KEY else None
 
@@ -266,6 +304,7 @@ LOGIN_HTML = f"""
 <h1>DNS Access</h1>
 <h2>Administrator Login</h2>
 <form method="post">
+<input type="hidden" name="csrf_token" value="{{{{ csrf_token }}}}">
 <input name="username" placeholder="Username" required>
 <br><br>
 <input type="password" name="password" placeholder="Password" required>
@@ -290,7 +329,17 @@ def login():
         username = request.form.get("username", "")
         password = request.form.get("password", "")
 
-        if username == ADMIN_USER and password == ADMIN_PASSWORD:
+        username_valid = hmac.compare_digest(
+            username.encode("utf-8"),
+            ADMIN_USER.encode("utf-8"),
+        )
+        password_valid = hmac.compare_digest(
+            password.encode("utf-8"),
+            ADMIN_PASSWORD.encode("utf-8"),
+        )
+
+        if username_valid and password_valid:
+            session.clear()
             session["authenticated"] = True
             return redirect(url_for("dashboard"))
 
@@ -299,7 +348,8 @@ def login():
     return render_template_string(LOGIN_HTML, error=error)
 
 
-@app.route("/admin/logout")
+@app.route("/admin/logout", methods=["POST"])
+@login_required
 def logout():
     session.clear()
     return redirect(url_for("login"))
@@ -366,9 +416,10 @@ def dashboard():
 
 <div class="card">
 <h1>DNS Access Admin</h1>
-<p>
-<a href="{{ url_for('logout') }}">Logout</a>
-</p>
+<form method="post" action="{{ url_for('logout') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button type="submit">Logout</button>
+</form>
 </div>
 
 <div class="grid">
@@ -397,6 +448,7 @@ def dashboard():
 <h2>Create User</h2>
 
 <form method="post" action="{{ url_for('create_user') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <div class="grid">
 
 <div>
@@ -469,16 +521,19 @@ def dashboard():
 <td>
 
 <form method="post" action="{{ url_for('renew_user', user_id=row['id']) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button class="success" type="submit">Renew 30d</button>
 </form>
 
 <form method="post" action="{{ url_for('toggle_user', user_id=row['id']) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button type="submit">
 {% if row["disabled"] %}Enable{% else %}Disable{% endif %}
 </button>
 </form>
 
 <form method="post" action="{{ url_for('delete_user', user_id=row['id']) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <button class="danger" type="submit">Delete</button>
 </form>
 
