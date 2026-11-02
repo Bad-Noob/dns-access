@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
 import hashlib
+import hmac
+import secrets
 import ipaddress
 import os
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from http.cookies import SimpleCookie, CookieError
+from urllib.parse import parse_qs, unquote
 from html import escape
 
 DB_FILE = "/opt/dns-access/data/users.db"
@@ -143,7 +146,8 @@ def nft_delete_ip(ip):
     )
 
 
-def html_page(title, message, success=True):
+
+def html_page(title, message, success=True, extra_html=""):
     status_class = "success" if success else "error"
 
     return f"""<!doctype html>
@@ -151,7 +155,8 @@ def html_page(title, message, success=True):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
+<meta name="referrer" content="no-referrer">
+<title>{escape(title)}</title>
 <style>
 body {{
     margin: 0;
@@ -183,12 +188,22 @@ h1 {{
 p {{
     line-height: 1.7;
 }}
+button {{
+    padding: 12px 24px;
+    border: 0;
+    border-radius: 8px;
+    background: #2563eb;
+    color: white;
+    font-size: 16px;
+    cursor: pointer;
+}}
 </style>
 </head>
 <body>
 <div class="card">
-<h1 class="{status_class}">{title}</h1>
-<p>{message}</p>
+<h1 class="{status_class}">{escape(title)}</h1>
+<p>{escape(message)}</p>
+{extra_html}
 </div>
 </body>
 </html>
@@ -198,22 +213,114 @@ p {{
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format_string, *args):
-        print(format_string % args)
+        message = format_string % args
 
-    def send_html(self, status, body):
+        if self.path.startswith("/join/"):
+            message = message.replace(
+                self.path,
+                "/join/[redacted]",
+            )
+
+        print(message)
+
+    def send_html(self, status, body, headers=None):
         encoded = body.encode("utf-8")
 
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        )
+
+        if headers:
+            for name, value in headers:
+                self.send_header(name, value)
+
         self.end_headers()
         self.wfile.write(encoded)
 
-    def do_GET(self):
+    def get_join_token(self):
         path = self.path.split("?", 1)[0]
 
         if not path.startswith("/join/"):
+            return None
+
+        return unquote(path[len("/join/"):]).strip()
+
+    def find_active_user(self, conn, token):
+        token_hash = hash_token(token)
+
+        user = conn.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE token_hash = ?
+            LIMIT 1
+            """,
+            (token_hash,),
+        ).fetchone()
+
+        if user is None:
+            self.send_html(
+                404,
+                html_page(
+                    "Invalid Link",
+                    "This access link is not valid.",
+                    False,
+                ),
+            )
+            return None
+
+        if user["disabled"]:
+            self.send_html(
+                403,
+                html_page(
+                    "Access Disabled",
+                    "This access link has been disabled.",
+                    False,
+                ),
+            )
+            return None
+
+        try:
+            expires_at = datetime.fromisoformat(user["expires_at"])
+
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        except (ValueError, TypeError):
+            self.send_html(
+                500,
+                html_page(
+                    "Access Error",
+                    "The access expiration date is invalid.",
+                    False,
+                ),
+            )
+            return None
+
+        if expires_at <= now_utc():
+            self.send_html(
+                403,
+                html_page(
+                    "Access Expired",
+                    "This access link has expired.",
+                    False,
+                ),
+            )
+            return None
+
+        return user
+
+    def do_GET(self):
+        token = self.get_join_token()
+
+        if token is None:
             self.send_html(
                 404,
                 html_page(
@@ -223,8 +330,6 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
             return
-
-        token = unquote(path[len("/join/"):]).strip()
 
         if not token:
             self.send_html(
@@ -237,55 +342,179 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        token_hash = hash_token(token)
-        ip = client_ip(self)
+        conn = get_db()
+
+        try:
+            user = self.find_active_user(conn, token)
+
+            if user is None:
+                return
+
+            csrf_token = secrets.token_urlsafe(32)
+            action = escape(
+                self.path.split("?", 1)[0],
+                quote=True,
+            )
+
+            form_html = (
+                f'<form method="post" action="{action}">'
+                f'<input type="hidden" name="csrf_token" '
+                f'value="{escape(csrf_token, quote=True)}">'
+                '<button type="submit">Activate DNS Access</button>'
+                '</form>'
+            )
+
+            cookie = (
+                f"dns_access_csrf={csrf_token}; "
+                "Path=/join/; HttpOnly; SameSite=Strict; Max-Age=600"
+            )
+
+            self.send_html(
+                200,
+                html_page(
+                    "Confirm DNS Access",
+                    "Press the button below to activate DNS access "
+                    "for your current IP address.",
+                    True,
+                    form_html,
+                ),
+                [("Set-Cookie", cookie)],
+            )
+
+        finally:
+            conn.close()
+
+    def do_POST(self):
+        token = self.get_join_token()
+
+        if token is None or not token:
+            self.send_html(
+                404,
+                html_page(
+                    "Not Found",
+                    "The requested page does not exist.",
+                    False,
+                ),
+            )
+            return
+
+        content_type = self.headers.get(
+            "Content-Type",
+            "",
+        ).split(";", 1)[0].strip().lower()
+
+        if content_type != "application/x-www-form-urlencoded":
+            self.send_html(
+                415,
+                html_page(
+                    "Invalid Request",
+                    "Unsupported request content type.",
+                    False,
+                ),
+            )
+            return
+
+        content_length = self.headers.get("Content-Length", "")
+
+        if not content_length.isdigit():
+            self.send_html(
+                411,
+                html_page(
+                    "Invalid Request",
+                    "A valid request length is required.",
+                    False,
+                ),
+            )
+            return
+
+        body_length = int(content_length)
+
+        if body_length <= 0 or body_length > 4096:
+            self.send_html(
+                413,
+                html_page(
+                    "Invalid Request",
+                    "The request body is invalid.",
+                    False,
+                ),
+            )
+            return
+
+        try:
+            body = self.rfile.read(body_length).decode("utf-8")
+            form = parse_qs(
+                body,
+                strict_parsing=True,
+                max_num_fields=10,
+            )
+        except (UnicodeDecodeError, ValueError):
+            self.send_html(
+                400,
+                html_page(
+                    "Invalid Request",
+                    "The submitted form is invalid.",
+                    False,
+                ),
+            )
+            return
+
+        submitted_tokens = form.get("csrf_token", [])
+
+        if len(submitted_tokens) != 1:
+            self.send_html(
+                403,
+                html_page(
+                    "Request Rejected",
+                    "The security token is missing or invalid.",
+                    False,
+                ),
+            )
+            return
+
+        cookies = SimpleCookie()
+
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            cookies = SimpleCookie()
+
+        csrf_cookie = cookies.get("dns_access_csrf")
+        submitted_csrf = submitted_tokens[0]
+
+        if (
+            csrf_cookie is None
+            or not submitted_csrf
+            or not hmac.compare_digest(
+                csrf_cookie.value,
+                submitted_csrf,
+            )
+        ):
+            self.send_html(
+                403,
+                html_page(
+                    "Request Rejected",
+                    "The security token is missing or invalid.",
+                    False,
+                ),
+            )
+            return
 
         conn = get_db()
 
         try:
-            user = conn.execute(
-                """
-                SELECT *
-                FROM users
-                WHERE token_hash = ?
-                LIMIT 1
-                """,
-                (token_hash,),
-            ).fetchone()
+            user = self.find_active_user(conn, token)
 
             if user is None:
-                self.send_html(
-                    404,
-                    html_page(
-                        "Invalid Link",
-                        "This access link is not valid.",
-                        False,
-                    ),
-                )
                 return
 
-            if user["disabled"]:
+            ip = client_ip(self)
+
+            if not valid_ip(ip):
                 self.send_html(
-                    403,
+                    400,
                     html_page(
-                        "Access Disabled",
-                        "This access link has been disabled.",
-                        False,
-                    ),
-                )
-                return
-
-            expires_at = datetime.fromisoformat(user["expires_at"])
-
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-            if expires_at <= now_utc():
-                self.send_html(
-                    403,
-                    html_page(
-                        "Access Expired",
-                        "This access link has expired.",
+                        "Invalid Address",
+                        "The client IP address is invalid.",
                         False,
                     ),
                 )
@@ -294,21 +523,21 @@ class Handler(BaseHTTPRequestHandler):
             old_ip4 = user["ip4"]
             old_ip6 = user["ip6"]
 
-            ip4 = old_ip4
-            ip6 = old_ip6
-
             if ":" in ip:
+                current_ip = old_ip6
+                ip4 = old_ip4
                 ip6 = ip
             else:
+                current_ip = old_ip4
                 ip4 = ip
+                ip6 = old_ip6
 
-            if old_ip4 and old_ip4 != ip4:
-                nft_delete_ip(old_ip4)
+            if ip == current_ip:
+                added = True
+            else:
+                added = nft_add_ip(ip, user["expires_at"])
 
-            if old_ip6 and old_ip6 != ip6:
-                nft_delete_ip(old_ip6)
-
-            if not nft_add_ip(ip, user["expires_at"]):
+            if not added:
                 self.send_html(
                     500,
                     html_page(
@@ -319,6 +548,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if current_ip and current_ip != ip:
+                nft_delete_ip(current_ip)
             updated_at = now_utc().isoformat()
 
             conn.execute(
@@ -339,21 +570,25 @@ class Handler(BaseHTTPRequestHandler):
 
             conn.commit()
 
-
             self.send_html(
                 200,
                 html_page(
                     "Access Activated",
-                    f"DNS access has been activated for this connection.<br><br>"
-                    f"Registered IP: <strong>{escape(ip)}</strong><br><br>"
-                    f"Expires: <strong>{escape(user['expires_at'])}</strong>",
+                    f"DNS access has been activated for {ip}. "
+                    f"Expiration: {user['expires_at']}",
                     True,
                 ),
+                [
+                    (
+                        "Set-Cookie",
+                        "dns_access_csrf=; Path=/join/; "
+                        "HttpOnly; SameSite=Strict; Max-Age=0",
+                    )
+                ],
             )
 
         finally:
             conn.close()
-
 
 def main():
     conn = get_db()
