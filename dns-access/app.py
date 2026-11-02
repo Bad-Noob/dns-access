@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import secrets
 import ipaddress
+import logging
 import os
 import sqlite3
 import subprocess
@@ -16,6 +17,8 @@ from html import escape
 DB_FILE = "/opt/dns-access/data/users.db"
 HOST = os.getenv("DNS_ACCESS_HOST", "0.0.0.0")
 PORT = int(os.getenv("DNS_ACCESS_PORT", "8787"))
+
+logger = logging.getLogger(__name__)
 
 
 def now_utc():
@@ -86,16 +89,26 @@ def nft_timeout_seconds(expires_at):
         return 0
 
 
-def nft_run(args):
+def nft_run(args, log_failure=True):
     try:
         subprocess.run(
             ["/usr/sbin/nft", *args],
             check=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         return True
-    except Exception:
+    except subprocess.CalledProcessError as exc:
+        if log_failure:
+            logger.error(
+                "nft command failed: %s",
+                (exc.stderr or "").strip() or "unknown nftables error",
+            )
+        return False
+    except OSError as exc:
+        if log_failure:
+            logger.error("nft command could not run: %s", exc)
         return False
 
 
@@ -109,9 +122,7 @@ def nft_add_ip(ip, expires_at):
         return False
 
     family = "dns6" if ":" in ip else "dns4"
-
-    command = [
-        "add",
+    element = [
         "element",
         "inet",
         "dnsaccess",
@@ -123,7 +134,10 @@ def nft_add_ip(ip, expires_at):
         "}",
     ]
 
-    return nft_run(command)
+    if nft_run(["replace", *element], log_failure=False):
+        return True
+
+    return nft_run(["add", *element])
 
 
 def nft_delete_ip(ip):
@@ -145,6 +159,52 @@ def nft_delete_ip(ip):
         ]
     )
 
+
+
+def nft_expiry_for_ip(conn, ip, exclude_user_id=None, include_expiry=None):
+    if not valid_ip(ip):
+        return None
+
+    now = now_utc()
+    query = """
+        SELECT id, expires_at
+        FROM users
+        WHERE disabled = 0
+          AND (ip4 = ? OR ip6 = ?)
+    """
+    params = [ip, ip]
+
+    if exclude_user_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_user_id)
+
+    rows = conn.execute(query, params).fetchall()
+    expirations = []
+
+    for row in rows:
+        try:
+            expiry = datetime.fromisoformat(row["expires_at"])
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry > now:
+                expirations.append(expiry)
+        except (TypeError, ValueError):
+            logger.warning("Invalid expiration value found for an IP assignment")
+
+    if include_expiry is not None:
+        try:
+            expiry = datetime.fromisoformat(include_expiry)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry > now:
+                expirations.append(expiry)
+        except (TypeError, ValueError):
+            logger.warning("Invalid requested expiration value for an IP assignment")
+
+    if not expirations:
+        return None
+
+    return max(expirations).isoformat()
 
 
 def html_page(title, message, success=True, extra_html=""):
@@ -502,6 +562,20 @@ class Handler(BaseHTTPRequestHandler):
         conn = get_db()
 
         try:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                logger.exception("Could not acquire database write transaction")
+                self.send_html(
+                    503,
+                    html_page(
+                        "Service Temporarily Unavailable",
+                        "Please try again shortly.",
+                        False,
+                    ),
+                )
+                return
+
             user = self.find_active_user(conn, token)
 
             if user is None:
@@ -532,12 +606,25 @@ class Handler(BaseHTTPRequestHandler):
                 ip4 = ip
                 ip6 = old_ip6
 
-            if ip == current_ip:
-                added = True
-            else:
-                added = nft_add_ip(ip, user["expires_at"])
+            shared_expiry = nft_expiry_for_ip(
+                conn,
+                ip,
+                exclude_user_id=user["id"],
+                include_expiry=user["expires_at"],
+            )
 
-            if not added:
+            if shared_expiry is None:
+                self.send_html(
+                    400,
+                    html_page(
+                        "Expired Access",
+                        "This access link has expired.",
+                        False,
+                    ),
+                )
+                return
+
+            if not nft_add_ip(ip, shared_expiry):
                 self.send_html(
                     500,
                     html_page(
@@ -548,8 +635,6 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if current_ip and current_ip != ip:
-                nft_delete_ip(current_ip)
             updated_at = now_utc().isoformat()
 
             conn.execute(
@@ -569,6 +654,16 @@ class Handler(BaseHTTPRequestHandler):
             )
 
             conn.commit()
+
+            if current_ip and current_ip != ip:
+                remaining_expiry = nft_expiry_for_ip(conn, current_ip)
+
+                if remaining_expiry is None:
+                    if not nft_delete_ip(current_ip):
+                        logger.error(
+                            "Could not remove obsolete IP address from nftables: %s",
+                            current_ip,
+                        )
 
             self.send_html(
                 200,

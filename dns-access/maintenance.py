@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
 import ipaddress
+import logging
 import os
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
 
 DB_FILE = "/opt/dns-access/data/users.db"
+
+logger = logging.getLogger(__name__)
+
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -29,16 +33,38 @@ def valid_ip(ip):
         return False
 
 
-def run(command):
+def parse_expiration(value):
+    try:
+        expires_at = datetime.fromisoformat(value)
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        return expires_at
+    except (TypeError, ValueError):
+        return None
+
+
+def run(command, log_failure=True):
     try:
         subprocess.run(
             command,
             check=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         return True
-    except Exception:
+    except subprocess.CalledProcessError as exc:
+        if log_failure:
+            logger.error(
+                "nft command failed: %s",
+                (exc.stderr or "").strip() or "unknown nftables error",
+            )
+        return False
+    except OSError as exc:
+        if log_failure:
+            logger.error("nft command could not run: %s", exc)
         return False
 
 
@@ -48,83 +74,111 @@ def nft_delete_ip(ip):
 
     family = "dns6" if ":" in ip else "dns4"
 
-    return run(
-        [
-            "/usr/sbin/nft",
-            "delete",
-            "element",
-            "inet",
-            "dnsaccess",
-            family,
-            "{",
-            ip,
-            "}",
-        ]
-    )
+    return run([
+        "/usr/sbin/nft",
+        "delete",
+        "element",
+        "inet",
+        "dnsaccess",
+        family,
+        "{",
+        ip,
+        "}",
+    ])
 
 
-def remove_expired_ips(conn):
-    now = now_utc().isoformat()
+def nft_add_ip(ip, expires_at):
+    if not valid_ip(ip):
+        return False
 
-    rows = conn.execute(
-        """
-        SELECT id, ip4, ip6
-        FROM users
-        WHERE expires_at <= ?
-           OR disabled = 1
-        """,
-        (now,),
-    ).fetchall()
-
-    for row in rows:
-        for ip in (row["ip4"], row["ip6"]):
-            nft_delete_ip(ip)
-
-
-def refresh_active_ips(conn):
     now = now_utc()
+    expiry = parse_expiration(expires_at)
 
+    if expiry is None:
+        return False
+
+    timeout = int((expiry - now).total_seconds())
+
+    if timeout <= 0:
+        return False
+
+    family = "dns6" if ":" in ip else "dns4"
+    element = [
+        "element",
+        "inet",
+        "dnsaccess",
+        family,
+        "{",
+        ip,
+        "timeout",
+        f"{timeout}s",
+        "}",
+    ]
+
+    if run(["/usr/sbin/nft", "replace", *element], log_failure=False):
+        return True
+
+    return run(["/usr/sbin/nft", "add", *element])
+
+
+def collect_ip_state(conn):
+    now = now_utc()
     rows = conn.execute(
         """
-        SELECT ip4, ip6, expires_at
+        SELECT ip4, ip6, expires_at, disabled
         FROM users
-        WHERE disabled = 0
-          AND expires_at > ?
-        """,
-        (now.isoformat(),),
+        """
     ).fetchall()
 
+    active_expirations = {}
+    inactive_ips = set()
+
     for row in rows:
-        expires_at = datetime.fromisoformat(row["expires_at"])
-
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-        seconds = int((expires_at - now).total_seconds())
-
-        if seconds <= 0:
-            continue
+        expiry = parse_expiration(row["expires_at"])
+        is_active = (
+            row["disabled"] == 0
+            and expiry is not None
+            and expiry > now
+        )
 
         for ip in (row["ip4"], row["ip6"]):
             if not valid_ip(ip):
                 continue
 
-            family = "dns6" if ":" in ip else "dns4"
+            if is_active:
+                previous = active_expirations.get(ip)
 
-            run(
-                [
-                    "/usr/sbin/nft",
-                    "add",
-                    "element",
-                    "inet",
-                    "dnsaccess",
-                    family,
-                    "{",
-                    ip,
-                    "timeout",
-                    f"{seconds}s",
-                    "}",
-                ]
+                if previous is None or expiry > previous:
+                    active_expirations[ip] = expiry
+            else:
+                inactive_ips.add(ip)
+
+    return active_expirations, inactive_ips
+
+
+def remove_expired_ips(conn, state=None):
+    if state is None:
+        state = collect_ip_state(conn)
+
+    active_expirations, inactive_ips = state
+
+    for ip in sorted(inactive_ips - set(active_expirations)):
+        if not nft_delete_ip(ip):
+            logger.error(
+                "Could not remove inactive IP address from nftables: %s",
+                ip,
+            )
+
+
+def refresh_active_ips(conn, active_expirations=None):
+    if active_expirations is None:
+        active_expirations, _ = collect_ip_state(conn)
+
+    for ip, expires_at in sorted(active_expirations.items()):
+        if not nft_add_ip(ip, expires_at.isoformat()):
+            logger.error(
+                "Could not refresh active IP address in nftables: %s",
+                ip,
             )
 
 
@@ -135,8 +189,19 @@ def main():
     conn = get_db()
 
     try:
-        remove_expired_ips(conn)
-        refresh_active_ips(conn)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            logger.exception("Could not acquire maintenance database transaction")
+            return
+
+        state = collect_ip_state(conn)
+        active_expirations, _ = state
+
+        remove_expired_ips(conn, state)
+        refresh_active_ips(conn, active_expirations)
+
+        conn.commit()
     finally:
         conn.close()
 
