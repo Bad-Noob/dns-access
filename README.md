@@ -74,6 +74,25 @@ The administrator password must contain at least 12 characters.
 
 The installer installs system packages, downloads the project and AdGuard Home, creates Python virtual environments, generates secrets, configures Unbound and nftables, installs systemd services, starts the services, and runs initial maintenance and health checks.
 
+## Optional DNS over HTTPS (DoH)
+
+The installer can optionally configure DNS over HTTPS (DoH) on TCP port 443.
+
+Requirements:
+
+- A domain name with an A record pointing to the server's public IPv4 address.
+- Inbound TCP port 80 reachable and available to Certbot during Let's Encrypt HTTP-01 certificate issuance and renewal.
+- Inbound TCP port 443 reachable for DoH clients.
+- Any configured AAAA record must point to a working IPv6 address on this server. Remove an incorrect AAAA record before installation.
+
+During installation, enable the optional DoH feature and provide the domain name. A Let's Encrypt email address is recommended for certificate expiry notifications.
+
+The installer obtains a certificate with Certbot, configures AdGuard Home to serve DoH at `https://DOMAIN/dns-query`, and installs a certificate renewal deploy hook that restarts AdGuard Home.
+
+This option enables DoH only. DNS-over-TLS and DNS-over-QUIC are not enabled by this option.
+
+DoH encrypts DNS requests between the client and the server. It does not hide the destination IP address or guarantee that network filtering or blocking will be bypassed.
+
 ## User Access Links
 
 Access links use this format:
@@ -185,6 +204,8 @@ Passwords, encryption keys, database contents, and server-specific secrets must 
 | Port | Protocol | Service |
 |---|---|---|
 | 53 | UDP/TCP | DNS |
+| 80 | TCP | Temporary Let's Encrypt HTTP-01 challenge and certificate renewal |
+| 443 | TCP | Optional DNS over HTTPS (DoH) |
 | 8787 | TCP | User access endpoint |
 | 8790 | TCP | Administrator panel |
 | 5353 | UDP/TCP | Local Unbound resolver |
@@ -204,9 +225,9 @@ Unbound and the AdGuard Home administrative interface are intended for local acc
 - Disabled and expired users lose DNS authorization through maintenance.
 - Deleting a user removes associated authorized IP addresses.
 
-The default access endpoint and administrator panel use HTTP, not HTTPS. The installer does not configure an HTTPS reverse proxy or automatically issue Let's Encrypt certificates.
+The default DNS Access user access endpoint and DNS Access administrator panel use HTTP, not HTTPS. Optional DoH configuration enables AdGuard Home's HTTPS listener on TCP port 443. This listener serves both DNS-over-HTTPS and the AdGuard Home web interface over HTTPS. It does not enable HTTPS for the separate DNS Access user access endpoint or DNS Access administrator panel.
 
-For production use, restrict administrator panel access and configure HTTPS through a separately managed reverse proxy if required.
+For production use, restrict access to administrative interfaces. Configure HTTPS for the DNS Access web interfaces separately if required. Keep TCP port 80 reachable and available to Certbot during HTTP-01 certificate issuance and renewal when optional DoH is enabled.
 
 ## Health Checks
 
