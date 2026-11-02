@@ -2,139 +2,223 @@
 
 A self-hosted DNS access management system for Ubuntu servers.
 
+DNS Access provides subscription-based DNS access using client IP authorization, a web-based administrator panel, nftables, AdGuard Home, and Unbound.
+
 ## Features
 
-- Interactive one-command installation
-- IPv4 support
-- Optional IPv6 support
-- Per-user access links
-- Automatic public IP registration
-- Automatic IP replacement when a user reconnects
-- DNS access restricted by authorized IP addresses
-- Recursive DNS resolution
-- DNS caching
-- DNS filtering
+- Interactive Ubuntu installation
+- IPv4 and optional IPv6 support
+- Individual user access links
+- Random access tokens
+- Automatic client source IP registration
+- Automatic IP replacement after network changes
+- Subscription expiration and renewal
+- User creation, activation, deactivation, and deletion
 - Web-based administrator panel
 - SQLite database
-- User expiration
-- User renewal
-- Enable and disable access
-- nftables-based DNS protection
-- systemd service management
-- Automatic certificate renewal
-- Periodic maintenance
-- Health checks
+- Encrypted storage of recoverable access links
+- nftables DNS access control
+- AdGuard Home DNS filtering and caching
+- Unbound recursive DNS resolution
+- Automated maintenance and health checks
+- systemd services and timers
+- Log rotation configuration
+
+## Architecture
+
+| Component | Purpose | Default Port |
+|---|---|---|
+| DNS Access | Token validation and client IP registration | TCP 8787 |
+| DNS Admin | User and subscription management | TCP 8790 |
+| AdGuard Home | DNS filtering and caching | UDP/TCP 53 |
+| Unbound | Recursive DNS resolver | UDP/TCP 5353 |
+| AdGuard Home UI | Local administration | TCP 8081 |
+
+DNS query flow:
+
+1. The client sends a DNS query to port 53.
+2. nftables checks the client's source IP address.
+3. Authorized requests reach AdGuard Home.
+4. AdGuard Home forwards queries to Unbound at 127.0.0.1:5353.
+5. Unbound performs recursive DNS resolution.
+
+Unbound uses root hints and DNSSEC trust-anchor configuration. It does not use an external recursive DNS forwarder.
 
 ## Requirements
 
-- Ubuntu
-- Root access
+- Ubuntu server
+- Root or sudo access
 - Public IPv4 address
-- IPv6 is optional
+- Public IPv6 address if IPv6 is enabled
+- Internet connectivity during installation
+- Interactive terminal access
+
+The installer requires an interactive terminal.
 
 ## Installation
 
-Run:
+Run the installer as root:
 
     curl -fsSL https://raw.githubusercontent.com/Bad-Noob/dns-access/main/install.sh | sudo bash
 
-The installer interactively asks for:
+The installer requests:
 
 - Public IPv4 address
 - Administrator username
 - Administrator password
-- IPv4 support
-- IPv6 support
+- IPv4 enablement
+- Optional IPv6 enablement and public IPv6 address
+- Installation confirmation
 
-The installer then:
+The administrator password must contain at least 12 characters.
 
-1. Installs required system packages.
-2. Downloads the project.
-3. Creates application directories.
-4. Creates isolated Python environments.
-5. Generates server secrets.
-6. Configures the DNS resolver.
-7. Installs the DNS filtering service.
-8. Configures nftables.
-9. Configures the DNS access and administrator services.
-10. Starts the required services.
-11. Runs health checks.
+The installer installs system packages, downloads the project and AdGuard Home, creates Python virtual environments, generates secrets, configures Unbound and nftables, installs systemd services, starts the services, and runs initial maintenance and health checks.
+
+## User Access Links
+
+Access links use this format:
+
+    http://SERVER-IP:8787/join/TOKEN
+
+When a user opens a valid link:
+
+- The token is validated against its stored hash.
+- Disabled and expired accounts are rejected.
+- The connecting client's source IP address is detected.
+- The IP address is associated with the user.
+- The authorized address is added to the appropriate nftables set.
+- A previous address is removed when the user reconnects from another network.
+
+IPv4 and IPv6 are supported when enabled.
+
+Access links are private credentials. Share them only with their intended users.
+
+## DNS Access Control
+
+nftables maintains two dynamic address sets:
+
+- dns4: authorized IPv4 addresses
+- dns6: authorized IPv6 addresses
+
+Authorized clients can use both UDP and TCP DNS.
+
+Unauthorized DNS traffic to port 53 is dropped. Local loopback DNS traffic is allowed.
+
+Authorization entries use timeouts based on subscription expiration. The maintenance service refreshes active entries and removes expired or disabled users.
+
+These rules control DNS traffic. They are not a general-purpose firewall policy for all server ports.
 
 ## DNS Resolution
 
-Unbound performs recursive DNS resolution directly. No external DNS
-forwarders or upstream mode selection are configured.
+### AdGuard Home
 
-## Access Links
+AdGuard Home listens on port 53 and provides DNS filtering and caching.
 
-Each user receives a unique access link:
+Its configuration is generated during installation. Its administrative interface is configured for local access on port 8081.
 
-    http://SERVER-IP:8787/join/<token>
+### Unbound
 
-When the user opens the link:
+Unbound listens on 127.0.0.1:5353 and performs recursive DNS resolution using root hints and DNSSEC trust-anchor configuration.
 
-1. The server validates the token.
-2. The current public IP address is detected.
-3. The IP address is associated with the user.
-4. DNS access is authorized for the remaining subscription period.
-5. The previous IP address is removed when necessary.
-
-Opening the same link from a new network replaces the previous address.
-
-## DNS
-
-Normal DNS service uses port 53.
-
-DNS access is protected by nftables and only authorized client addresses are permitted.
-
-DNS over HTTPS is not provided. DNS clients connect directly to the server using DNS on port 53.
+AdGuard Home forwards DNS queries to Unbound locally.
 
 ## Administrator Panel
 
-The administrator panel is available at:
+Open the panel at:
 
     http://SERVER-IP:8790/admin/
 
 The panel provides:
 
 - Administrator authentication
-- User creation
-- Subscription duration
-- User listing
+- User creation with configurable duration
+- User list and subscription status
 - Expiration information
-- IPv4 and IPv6 information
-- User renewal
+- Registered IPv4 and IPv6 addresses
+- Subscription renewal by 30 days
 - Enable and disable controls
 - User deletion
 - Access link retrieval
-- Basic statistics
+- Total, active, disabled, and expired user statistics
+
+New users can be created with a duration from 1 to 3650 days.
+
+## Services and Maintenance
+
+The installer configures these services:
+
+| Service | Purpose |
+|---|---|
+| dns-access.service | User access endpoint |
+| dns-admin.service | Administrator panel |
+| AdGuardHome.service | DNS filtering |
+| unbound.service | Recursive DNS |
+| nftables.service | DNS firewall rules |
+| dns-maintenance.service | Subscription and firewall maintenance |
+| healthcheck.service | Service health checks |
+
+Automatic timers:
+
+- dns-maintenance.timer
+- healthcheck.timer
+- dns-access-logrotate.timer
+
+## Configuration and Data
+
+Important runtime paths:
+
+| Path | Description |
+|---|---|
+| /opt/dns-access/ | DNS Access application |
+| /opt/dns-access/data/users.db | SQLite database |
+| /opt/dns-admin/ | Administrator application |
+| /opt/AdGuardHome/ | AdGuard Home installation |
+| /etc/dns-access.conf | DNS Access environment |
+| /etc/dns-admin.env | Administrator credentials and secrets |
+| /etc/dns-access/ | DNS Access configuration |
+| /etc/unbound/ | Unbound configuration |
+
+Passwords, encryption keys, database contents, and server-specific secrets must not be committed to the repository.
+
+## Network Ports
+
+| Port | Protocol | Service |
+|---|---|---|
+| 53 | UDP/TCP | DNS |
+| 8787 | TCP | User access endpoint |
+| 8790 | TCP | Administrator panel |
+| 5353 | UDP/TCP | Local Unbound resolver |
+| 8081 | TCP | Local AdGuard Home interface |
+
+The access endpoint and administrator panel bind to 0.0.0.0 by default. Restrict administrator panel access using a suitable firewall or secure reverse proxy.
+
+Unbound and the AdGuard Home administrative interface are intended for local access.
 
 ## Security
 
-The system uses:
+- DNS access is restricted using nftables IP authorization.
+- Access tokens are stored as SHA-256 hashes.
+- Recoverable access links are encrypted using Fernet when the encryption key is available.
+- Administrator credentials and application secrets are stored outside the repository.
+- Sensitive configuration files receive restrictive permissions.
+- Disabled and expired users lose DNS authorization through maintenance.
+- Deleting a user removes associated authorized IP addresses.
 
-- HTTPS
-- Let's Encrypt certificates
-- IP-based DNS authorization
-- nftables
-- Restricted local service bindings
-- Root-owned configuration
-- SQLite
-- Encrypted stored access links
-- Generated application secrets
-- systemd service isolation
-- Automatic maintenance
+The default access endpoint and administrator panel use HTTP, not HTTPS. The installer does not configure an HTTPS reverse proxy or automatically issue Let's Encrypt certificates.
 
-Generated passwords, keys, and certificates are stored outside the repository.
+For production use, restrict administrator panel access and configure HTTPS through a separately managed reverse proxy if required.
+
+## Health Checks
+
+The health-check script checks service status, DNS listeners, application ports, nftables configuration, and Unbound configuration.
+
+Run it manually:
+
+    sudo /opt/dns-access/healthcheck.sh
 
 ## Repository Structure
 
     dns-access/
-    ├── install.sh
-    ├── VERSION
-    ├── README.md
-    ├── LICENSE
-    │
     ├── dns-access/
     │   ├── app.py
     │   ├── maintenance.py
@@ -142,42 +226,42 @@ Generated passwords, keys, and certificates are stored outside the repository.
     │   ├── requirements.txt
     │   ├── Makefile
     │   └── __init__.py
-    │
     ├── dns-admin/
     │   ├── app.py
     │   ├── requirements.txt
     │   └── __init__.py
-    │
+    ├── config/
+    │   ├── AdGuardHome.service
+    │   ├── AdGuardHome.yaml
+    │   ├── defaults.conf
+    │   ├── dns-access.conf
+    │   ├── dns-access.env
+    │   ├── dns-access.service
+    │   ├── dns-admin.env
+    │   ├── dns-admin.service
+    │   ├── dns-maintenance.service
+    │   ├── dns-maintenance.timer
+    │   ├── dns-access-logrotate
+    │   ├── dns-access-logrotate.service
+    │   ├── dns-access-logrotate.timer
+    │   ├── healthcheck.service
+    │   ├── healthcheck.timer
+    │   ├── limits.conf
+    │   ├── logrotate.conf
+    │   ├── nftables.conf
+    │   ├── nftables.service
+    │   ├── sysctl.conf
+    │   ├── tmpfiles.conf
+    │   ├── unbound.conf
+    │   ├── unbound.service
+    │   └── README.md
     ├── scripts/
-    │   ├── prepare-directories.sh
-    │   ├── check-requirements.sh
-    │   ├── generate-secrets.sh
-    │   ├── check-dns.sh
-    │   ├── test-unbound.sh
-    │   ├── test-nftables.sh
-    │   ├── test-services.sh
-    │   ├── run-tests.sh
-    │   ├── version.sh
-    │   └── check-project.sh
-    │
-    └── config/
-        ├── AdGuardHome.service
-        ├── AdGuardHome.yaml
-        ├── dns-access.conf
-        ├── dns-access.env
-        ├── dns-access.service
-        ├── dns-admin.env
-        ├── dns-admin.service
-        ├── dns-maintenance.service
-        ├── dns-maintenance.timer
-        ├── healthcheck.service
-        ├── healthcheck.timer
-        ├── nftables.conf
-        ├── nftables.service
-        ├── tmpfiles.conf
-        ├── unbound.conf
-        └── unbound.service
+    ├── .gitignore
+    ├── install.sh
+    ├── LICENSE
+    ├── README.md
+    └── VERSION
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License. See LICENSE.
