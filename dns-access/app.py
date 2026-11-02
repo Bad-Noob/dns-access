@@ -356,6 +356,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    conn = get_db()
+    conn.close()
+
     server = ThreadingHTTPServer((HOST, PORT), Handler)
 
     print(f"DNS Access Service listening on {HOST}:{PORT}")
